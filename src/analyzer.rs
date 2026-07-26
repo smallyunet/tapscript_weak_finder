@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ripemd::Ripemd160;
 use serde::Serialize;
 use sha1::Sha1;
@@ -5,6 +7,13 @@ use sha2::{Digest, Sha256};
 
 pub const ANALYZER_VERSION: &str = concat!("tapscript-weak-finder/", env!("CARGO_PKG_VERSION"));
 pub const SEARCH_WITNESS_ATOMS: &[&str] = &["empty", "01"];
+pub const SEARCH_STRATEGIES: &[&str] = &[
+    "boolean_exhaustive",
+    "small_numbers_and_script_constants",
+    "observed_signature_removal",
+];
+pub const RICH_SEARCH_MAX_DEPTH: usize = 3;
+pub const MAX_SCRIPT_DERIVED_ATOMS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +40,7 @@ pub struct AnalysisResult {
     pub status: AnalysisStatus,
     pub vulnerability_class: Option<String>,
     pub proof_witness: Option<Vec<String>>,
+    pub proof_strategy: Option<String>,
     pub execution_trace: Vec<TraceStep>,
     pub valid_signatures_required: u32,
     pub limitations: Vec<String>,
@@ -66,6 +76,14 @@ enum RunResult {
 }
 
 pub fn analyze_script(script: &[u8], max_witness_items: usize) -> AnalysisResult {
+    analyze_script_with_observed_witness(script, max_witness_items, &[])
+}
+
+pub fn analyze_script_with_observed_witness(
+    script: &[u8],
+    max_witness_items: usize,
+    observed_witness: &[Vec<u8>],
+) -> AnalysisResult {
     let parsed = parse_script(script);
     let instructions = match parsed {
         ParseResult::OpSuccess { offset, opcode } => {
@@ -73,6 +91,7 @@ pub fn analyze_script(script: &[u8], max_witness_items: usize) -> AnalysisResult
                 status: AnalysisStatus::Weak,
                 vulnerability_class: Some("op_success_unconditional".to_owned()),
                 proof_witness: Some(Vec::new()),
+                proof_strategy: Some("opcode_short_circuit".to_owned()),
                 execution_trace: vec![TraceStep {
                     offset,
                     opcode: format!("OP_SUCCESS{}", opcode),
@@ -91,6 +110,7 @@ pub fn analyze_script(script: &[u8], max_witness_items: usize) -> AnalysisResult
                 status: AnalysisStatus::InvalidScript,
                 vulnerability_class: None,
                 proof_witness: None,
+                proof_strategy: None,
                 execution_trace: Vec::new(),
                 valid_signatures_required: 0,
                 limitations: Vec::new(),
@@ -101,50 +121,43 @@ pub fn analyze_script(script: &[u8], max_witness_items: usize) -> AnalysisResult
 
     let max_items = max_witness_items.min(12);
     let mut saw_unsupported = false;
-    for depth in 0..=max_items {
-        let candidate_count = 1usize << depth;
-        for mask in 0..candidate_count {
-            let witness = (0..depth)
-                .map(|index| {
-                    if mask & (1 << index) == 0 {
-                        Vec::new()
-                    } else {
-                        vec![1]
-                    }
-                })
-                .collect::<Vec<_>>();
-            match execute(&instructions, witness.clone()) {
-                RunResult::Success {
-                    trace,
-                    unknown_pubkey_success,
-                } => {
-                    return AnalysisResult {
-                        status: AnalysisStatus::Weak,
-                        vulnerability_class: Some(
-                            if unknown_pubkey_success {
-                                "upgradable_pubkey_type"
-                            } else {
-                                "signatureless_satisfaction"
-                            }
-                            .to_owned(),
-                        ),
-                        proof_witness: Some(witness.iter().map(hex::encode).collect()),
-                        execution_trace: trace,
-                        valid_signatures_required: 0,
-                        limitations: if unknown_pubkey_success {
-                            vec![
-                                "Consensus-valid today but normally rejected by standard relay policy"
-                                    .to_owned(),
-                                "Semantics may be restricted by a future soft fork".to_owned(),
-                            ]
-                        } else {
-                            Vec::new()
-                        },
-                    };
-                }
-                RunResult::Unsupported => saw_unsupported = true,
-                RunResult::Failed => {}
-            }
+    let boolean_atoms = vec![Vec::new(), vec![1]];
+    if let Some(result) = search_cartesian(
+        &instructions,
+        &boolean_atoms,
+        max_items,
+        SEARCH_STRATEGIES[0],
+        |_| true,
+        &mut saw_unsupported,
+    ) {
+        return result;
+    }
+
+    let rich_atoms = rich_witness_atoms(&instructions);
+    let rich_depth = max_items.min(RICH_SEARCH_MAX_DEPTH);
+    if let Some(result) = search_cartesian(
+        &instructions,
+        &rich_atoms,
+        rich_depth,
+        SEARCH_STRATEGIES[1],
+        |witness| {
+            witness
+                .iter()
+                .any(|item| !item.is_empty() && item.as_slice() != [1])
+        },
+        &mut saw_unsupported,
+    ) {
+        return result;
+    }
+
+    for witness in observed_signature_removal_candidates(observed_witness, max_items) {
+        if let Some(result) = evaluate_candidate(
+            &instructions,
+            witness,
+            SEARCH_STRATEGIES[2],
+            &mut saw_unsupported,
+        ) {
+            return result;
         }
     }
 
@@ -156,11 +169,179 @@ pub fn analyze_script(script: &[u8], max_witness_items: usize) -> AnalysisResult
         },
         vulnerability_class: None,
         proof_witness: None,
+        proof_strategy: None,
         execution_trace: Vec::new(),
         valid_signatures_required: 0,
-        limitations: vec![format!(
-            "Bounded search uses only empty and minimally true witness atoms, up to {max_items} items"
-        )],
+        limitations: vec![
+            format!("Boolean search uses empty and minimally true atoms up to {max_items} items"),
+            format!(
+                "Small-number and script-constant search is capped at {rich_depth} witness items"
+            ),
+            "Observed-witness search tries each 64/65-byte signature-shaped item individually \
+             emptied or removed, plus all such items emptied or removed"
+                .to_owned(),
+            "No proof found inside these bounded strategies is not a safety proof".to_owned(),
+        ],
+    }
+}
+
+fn search_cartesian<F>(
+    instructions: &[Instruction],
+    atoms: &[Vec<u8>],
+    max_depth: usize,
+    strategy: &str,
+    include: F,
+    saw_unsupported: &mut bool,
+) -> Option<AnalysisResult>
+where
+    F: Fn(&[Vec<u8>]) -> bool,
+{
+    for depth in 0..=max_depth {
+        let candidate_count = atoms.len().checked_pow(depth as u32)?;
+        for ordinal in 0..candidate_count {
+            let mut cursor = ordinal;
+            let witness = (0..depth)
+                .map(|_| {
+                    let atom = atoms[cursor % atoms.len()].clone();
+                    cursor /= atoms.len();
+                    atom
+                })
+                .collect::<Vec<_>>();
+            if !include(&witness) {
+                continue;
+            }
+            if let Some(result) =
+                evaluate_candidate(instructions, witness, strategy, saw_unsupported)
+            {
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
+fn evaluate_candidate(
+    instructions: &[Instruction],
+    witness: Vec<Vec<u8>>,
+    strategy: &str,
+    saw_unsupported: &mut bool,
+) -> Option<AnalysisResult> {
+    match execute(instructions, witness.clone()) {
+        RunResult::Success {
+            trace,
+            unknown_pubkey_success,
+        } => Some(AnalysisResult {
+            status: AnalysisStatus::Weak,
+            vulnerability_class: Some(
+                if unknown_pubkey_success {
+                    "upgradable_pubkey_type"
+                } else {
+                    "signatureless_satisfaction"
+                }
+                .to_owned(),
+            ),
+            proof_witness: Some(witness.iter().map(hex::encode).collect()),
+            proof_strategy: Some(strategy.to_owned()),
+            execution_trace: trace,
+            valid_signatures_required: 0,
+            limitations: if unknown_pubkey_success {
+                vec![
+                    "Consensus-valid today but normally rejected by standard relay policy"
+                        .to_owned(),
+                    "Semantics may be restricted by a future soft fork".to_owned(),
+                ]
+            } else {
+                vec![
+                    "A signatureless path can be intentional; ownership and policy intent are not inferred"
+                        .to_owned(),
+                ]
+            },
+        }),
+        RunResult::Unsupported => {
+            *saw_unsupported = true;
+            None
+        }
+        RunResult::Failed => None,
+    }
+}
+
+fn rich_witness_atoms(instructions: &[Instruction]) -> Vec<Vec<u8>> {
+    let mut atoms = vec![Vec::new(), vec![1], vec![0x80], encode_script_num(-1)];
+    for value in 2..=16 {
+        push_unique(&mut atoms, encode_script_num(value));
+    }
+    let mut derived_atoms = 0;
+    for pushed in instructions
+        .iter()
+        .filter_map(|instruction| instruction.pushed.as_ref())
+        .filter(|value| value.len() <= 520)
+    {
+        if push_unique(&mut atoms, pushed.clone()) {
+            derived_atoms += 1;
+            if derived_atoms == MAX_SCRIPT_DERIVED_ATOMS {
+                break;
+            }
+        }
+    }
+    atoms
+}
+
+fn observed_signature_removal_candidates(
+    observed_witness: &[Vec<u8>],
+    max_items: usize,
+) -> Vec<Vec<Vec<u8>>> {
+    let signature_indexes = observed_witness
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| matches!(item.len(), 64 | 65).then_some(index))
+        .collect::<Vec<_>>();
+    if signature_indexes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for index in &signature_indexes {
+        let mut emptied = observed_witness.to_vec();
+        emptied[*index].clear();
+        if emptied.len() <= max_items && seen.insert(emptied.clone()) {
+            candidates.push(emptied);
+        }
+
+        let mut removed = observed_witness.to_vec();
+        removed.remove(*index);
+        if removed.len() <= max_items && seen.insert(removed.clone()) {
+            candidates.push(removed);
+        }
+    }
+
+    let mut all_emptied = observed_witness.to_vec();
+    for index in &signature_indexes {
+        all_emptied[*index].clear();
+    }
+    if all_emptied.len() <= max_items && seen.insert(all_emptied.clone()) {
+        candidates.push(all_emptied);
+    }
+
+    let all_removed = observed_witness
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !signature_indexes.contains(index))
+        .map(|(_, item)| item.clone())
+        .collect::<Vec<_>>();
+    if all_removed.len() <= max_items && seen.insert(all_removed.clone()) {
+        candidates.push(all_removed);
+    }
+
+    candidates
+}
+
+fn push_unique(values: &mut Vec<Vec<u8>>, value: Vec<u8>) -> bool {
+    if !values.contains(&value) {
+        values.push(value);
+        true
+    } else {
+        false
     }
 }
 
@@ -764,5 +945,105 @@ mod tests {
     fn script_num_negative_zero_is_false() {
         assert!(!cast_to_bool(&[0x80]));
         assert!(cast_to_bool(&[0x01]));
+    }
+
+    #[test]
+    fn rich_search_finds_a_small_number_outside_the_boolean_alphabet() {
+        let result = analyze_script(&[0x52, 0x87], 1);
+
+        assert!(matches!(result.status, AnalysisStatus::Weak));
+        assert_eq!(result.proof_witness.unwrap(), vec!["02"]);
+        assert_eq!(
+            result.proof_strategy.as_deref(),
+            Some("small_numbers_and_script_constants")
+        );
+    }
+
+    #[test]
+    fn rich_search_uses_a_constant_pushed_by_the_script() {
+        let result = analyze_script(&[0x02, 0xaa, 0xbb, 0x87], 1);
+
+        assert!(matches!(result.status, AnalysisStatus::Weak));
+        assert_eq!(result.proof_witness.unwrap(), vec!["aabb"]);
+        assert_eq!(
+            result.proof_strategy.as_deref(),
+            Some("small_numbers_and_script_constants")
+        );
+    }
+
+    #[test]
+    fn duplicate_script_constants_do_not_consume_the_unique_atom_limit() {
+        let mut script = Vec::new();
+        for _ in 0..MAX_SCRIPT_DERIVED_ATOMS {
+            script.extend_from_slice(&[0x02, 0xaa, 0xbb]);
+        }
+        script.extend_from_slice(&[0x02, 0xcc, 0xdd]);
+        let instructions = match parse_script(&script) {
+            ParseResult::Instructions(instructions) => instructions,
+            _ => panic!("test script must parse"),
+        };
+
+        let atoms = rich_witness_atoms(&instructions);
+
+        assert!(atoms.contains(&vec![0xaa, 0xbb]));
+        assert!(atoms.contains(&vec![0xcc, 0xdd]));
+    }
+
+    #[test]
+    fn observed_search_can_empty_a_signature_shaped_item() {
+        let data = b"observed-data".to_vec();
+        let digest = Sha256::digest(&data);
+        let script = [vec![0x75, 0xa8, 0x20], digest.to_vec(), vec![0x87]].concat();
+        let observed_witness = vec![data.clone(), vec![0x42; 64]];
+
+        let without_observation = analyze_script(&script, 2);
+        let with_observation = analyze_script_with_observed_witness(&script, 2, &observed_witness);
+
+        assert!(matches!(
+            without_observation.status,
+            AnalysisStatus::NoProofFound
+        ));
+        assert!(matches!(with_observation.status, AnalysisStatus::Weak));
+        assert_eq!(with_observation.proof_witness.unwrap(), vec![
+            hex::encode(data),
+            String::new()
+        ]);
+        assert_eq!(
+            with_observation.proof_strategy.as_deref(),
+            Some("observed_signature_removal")
+        );
+    }
+
+    #[test]
+    fn observed_search_respects_the_witness_item_bound() {
+        let data = b"observed-data".to_vec();
+        let digest = Sha256::digest(&data);
+        let script = [vec![0x75, 0xa8, 0x20], digest.to_vec(), vec![0x87]].concat();
+        let observed_witness = vec![data, vec![0x42; 64]];
+        let result = analyze_script_with_observed_witness(&script, 1, &observed_witness);
+
+        assert!(matches!(result.status, AnalysisStatus::NoProofFound));
+        assert!(result.proof_witness.is_none());
+        assert!(result.proof_strategy.is_none());
+    }
+
+    #[test]
+    fn observed_search_can_remove_items_to_reach_the_witness_bound() {
+        let observed_witness = vec![vec![0x11], vec![0x22], vec![0x42; 64]];
+
+        let candidates = observed_signature_removal_candidates(&observed_witness, 2);
+
+        assert!(candidates.contains(&vec![vec![0x11], vec![0x22]]));
+        assert!(candidates.iter().all(|candidate| candidate.len() <= 2));
+    }
+
+    #[test]
+    fn observed_search_includes_the_all_removed_variant() {
+        let observed_witness = vec![vec![0x11], vec![0x42; 64], vec![0x43; 65]];
+
+        let candidates = observed_signature_removal_candidates(&observed_witness, 1);
+
+        assert!(candidates.contains(&vec![vec![0x11]]));
+        assert!(candidates.iter().all(|candidate| candidate.len() <= 1));
     }
 }

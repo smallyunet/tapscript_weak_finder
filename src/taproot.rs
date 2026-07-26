@@ -4,6 +4,9 @@ use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
 pub struct RevealedScriptPath {
+    /// Witness elements supplied as the TapScript initial stack, after
+    /// removing the optional annex, script, and control block.
+    pub initial_stack: Vec<Vec<u8>>,
     pub script: Vec<u8>,
     pub control_block: Vec<u8>,
     pub annex: Option<Vec<u8>>,
@@ -52,6 +55,9 @@ pub fn single_leaf_commitment(script: &[u8]) -> Result<SingleLeafCommitment> {
     })
 }
 
+/// Returns a verified script-path revelation, or `None` when the witness has
+/// key-path shape. This function verifies only script-path commitments; it
+/// does not validate key-path signatures.
 pub fn parse_and_verify_script_path(
     witness_hex: &[String],
     expected_output_key: &[u8; 32],
@@ -75,11 +81,8 @@ pub fn parse_and_verify_script_path(
         None
     };
 
-    if witness.len() == 1 {
+    if witness.len() <= 1 {
         return Ok(None);
-    }
-    if witness.len() < 2 {
-        bail!("Taproot witness is empty after annex removal");
     }
 
     let control_block = witness.pop().expect("length checked");
@@ -87,6 +90,7 @@ pub fn parse_and_verify_script_path(
     let proof = verify_control_block(&script, &control_block, expected_output_key)?;
 
     Ok(Some(RevealedScriptPath {
+        initial_stack: witness,
         script,
         control_block,
         annex,
@@ -257,8 +261,105 @@ mod tests {
         let reveal = parse_and_verify_script_path(&witness, &output_key)
             .unwrap()
             .unwrap();
+        assert_eq!(reveal.initial_stack, vec![vec![0x51], Vec::new()]);
         assert_eq!(hex::encode(reveal.script), script);
         assert_eq!(reveal.leaf_version, 0xc0);
         assert!(reveal.merkle_path.is_empty());
+    }
+
+    #[test]
+    fn extracts_annex_and_an_empty_tapscript_initial_stack() {
+        let script = [0x51];
+        let commitment = single_leaf_commitment(&script).unwrap();
+        let witness = vec![
+            hex::encode(script),
+            hex::encode(&commitment.control_block),
+            "50aabb".to_owned(),
+        ];
+
+        let reveal = parse_and_verify_script_path(&witness, &commitment.output_key)
+            .unwrap()
+            .unwrap();
+
+        assert!(reveal.initial_stack.is_empty());
+        assert_eq!(reveal.annex, Some(vec![0x50, 0xaa, 0xbb]));
+        assert_eq!(reveal.script, script);
+        assert_eq!(reveal.control_block, commitment.control_block);
+    }
+
+    #[test]
+    fn preserves_a_stack_item_starting_with_annex_tag() {
+        let script = [0x51];
+        let commitment = single_leaf_commitment(&script).unwrap();
+        let witness = vec![
+            "50aabb".to_owned(),
+            hex::encode(script),
+            hex::encode(&commitment.control_block),
+        ];
+
+        let reveal = parse_and_verify_script_path(&witness, &commitment.output_key)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(reveal.initial_stack, vec![vec![0x50, 0xaa, 0xbb]]);
+        assert!(reveal.annex.is_none());
+    }
+
+    #[test]
+    fn recognizes_key_path_spends_with_or_without_an_annex() {
+        let output_key = [0x11; 32];
+        let key_path = vec!["22".repeat(64)];
+        let key_path_with_annex = vec!["22".repeat(64), "50aabb".to_owned()];
+
+        assert!(
+            parse_and_verify_script_path(&key_path, &output_key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_and_verify_script_path(&key_path_with_annex, &output_key)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_an_output_key_mismatch() {
+        let script = [0x51];
+        let commitment = single_leaf_commitment(&script).unwrap();
+        let witness = vec![hex::encode(script), hex::encode(&commitment.control_block)];
+        let wrong_output_key = [0x22; 32];
+
+        let error = parse_and_verify_script_path(&witness, &wrong_output_key)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("does not commit to prevout output key"));
+    }
+
+    #[test]
+    fn rejects_an_invalid_control_block_length() {
+        let witness = vec!["51".to_owned(), "c0".to_owned()];
+
+        let error = parse_and_verify_script_path(&witness, &[0x22; 32])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("invalid control block length 1"));
+    }
+
+    #[test]
+    fn rejects_a_control_block_parity_mismatch() {
+        let script = [0x51];
+        let commitment = single_leaf_commitment(&script).unwrap();
+        let mut control_block = commitment.control_block;
+        control_block[0] ^= 1;
+        let witness = vec![hex::encode(script), hex::encode(control_block)];
+
+        let error = parse_and_verify_script_path(&witness, &commitment.output_key)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("output-key parity mismatch"));
     }
 }

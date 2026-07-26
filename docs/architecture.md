@@ -23,7 +23,7 @@ flowchart TD
     C --> D{"Script-path spend?"}
     D -- "No" --> E["Update SQLite checkpoint"]
     D -- "Yes" --> F["Verify BIP 341 control-block commitment"]
-    F --> G["Persist revealed leaf and observed witness"]
+    F --> G["Extract initial stack and persist revelation evidence"]
     G --> H{"Leaf version 0xc0?"}
     H -- "No" --> E
     H -- "Yes" --> I["Bounded signatureless witness search"]
@@ -48,7 +48,7 @@ flowchart TD
 | `src/main.rs` | CLI parsing, authentication selection, command dispatch, and JSON output. |
 | `src/rpc.rs` | Blocking Bitcoin Core JSON-RPC client and exact BTC-to-satoshi decoding. |
 | `src/scanner.rs` | Scan-range validation, canonical iteration, interruption handling, resume, and reorganization reconciliation. |
-| `src/taproot.rs` | P2TR detection, annex and control-block parsing, tagged hashes, and output-key verification. |
+| `src/taproot.rs` | P2TR detection, annex/script/control-block separation, TapScript initial-stack extraction, tagged hashes, and output-key verification. |
 | `src/analyzer.rs` | TapScript parsing, bounded witness generation, partial execution, classification, and tracing. |
 | `src/core_validator.rs` | Temporary isolated regtest lifecycle, synthetic fixture construction, candidate serialization, and Bitcoin Core validation. |
 | `src/detection.rs` | Detection, consensus, and policy evidence states plus the validator boundary. |
@@ -155,7 +155,7 @@ Rollback:
 For a candidate script-path witness, the verifier:
 
 1. removes an annex when the last witness element starts with `0x50`;
-2. separates witness arguments, script, and control block;
+2. separates the TapScript initial stack, script, and control block;
 3. validates the control-block length and Merkle depth;
 4. extracts the leaf version and internal key;
 5. computes the tagged `TapLeaf` hash;
@@ -168,16 +168,20 @@ Only leaf version `0xc0` is passed to the current TapScript analyzer.
 
 ## Analyzer boundary
 
-The analyzer parses the script and searches witness stacks containing only two
-atoms:
+The analyzer parses the script and runs three bounded strategies in order:
 
-```text
-<empty>
-01
-```
+1. exhaustive combinations of empty and minimally true items through the
+   configured depth, capped at 12 items;
+2. small-number atoms and up to eight unique constants pushed by the script,
+   capped at three items;
+3. during scanning, variants of the verified initial stack that empty or remove
+   each 64/65-byte signature-shaped item individually, then all such items
+   together.
 
-It tries every combination from depth zero through the configured maximum,
-capped at 12 items.
+The standalone script command has no observed transaction witness, so the third
+strategy has no candidates there. The first successful candidate records its
+strategy, witness, and execution trace. Search configuration records the
+strategy names and limits, but not every dynamically generated candidate.
 
 The executor supports a useful subset of TapScript operations, including
 conditionals, common stack operations, comparisons, arithmetic, hashes,
@@ -253,6 +257,7 @@ erDiagram
         integer tapleaf_id PK
         text vulnerability_class
         text proof_witness_json
+        text proof_strategy
         text execution_trace_json
         text limitations_json
     }
@@ -287,6 +292,13 @@ cleared. Weaknesses and abnormal outcomes (`inconclusive` or `invalid_script`)
 retain the full evidence needed for review. Re-observing a compacted leaf
 temporarily restores its script from RPC before analysis, so a later analyzer
 version can still promote it to a retained finding.
+
+Candidate evidence is updated atomically with its matching analyzer version and
+search configuration when a later candidate is found. A later
+`no_proof_found`, `inconclusive`, or `invalid_script` result does not downgrade
+an existing candidate. Once Bitcoin Core validation promotes a result to
+`confirmed_weak`, later local candidate generation does not replace its proof
+or authoritative validation evidence.
 
 RPC response bodies are fed directly into the JSON deserializer through a
 configured byte-limited reader. This bounds the raw input buffering but is not

@@ -51,7 +51,8 @@ motivation and the limits imposed by Taproot privacy.
 - Maintains a local P2TR UTXO index in SQLite.
 - Detects Taproot script-path spends and verifies their control-block
   commitment against the spent output key.
-- Analyzes revealed leaf-version `0xc0` TapScripts with a bounded witness search.
+- Analyzes revealed leaf-version `0xc0` TapScripts with bounded boolean,
+  small-number/script-constant, and observed-signature-removal searches.
 - Optionally validates candidate witnesses with Bitcoin Core in an isolated
   synthetic regtest.
 - Stores full evidence for weak and abnormal results, compact summaries for
@@ -151,9 +152,25 @@ The analysis contains:
 - `status`
 - `vulnerability_class`
 - `proof_witness`
+- `proof_strategy`
 - `execution_trace`
 - `valid_signatures_required`
 - `limitations`
+
+The analyzer searches in this order:
+
+1. Every combination of empty and minimally true items through the configured
+   depth, capped at 12 witness items.
+2. Small script numbers plus up to eight unique constants pushed by the script,
+   capped at three witness items.
+3. During chain scanning only, variants of the verified TapScript initial stack
+   with each observed 64/65-byte signature-shaped item emptied or removed, plus
+   variants that empty or remove all such items together.
+
+The standalone `analyze-script` command has no observed transaction witness, so
+its third strategy has no candidates. Each successful result names the strategy
+that produced its proof. These strategies are bounded candidate generators;
+Bitcoin Core validation is still required for `confirmed_weak`.
 
 ### Scan with Bitcoin Core cookie authentication
 
@@ -258,7 +275,9 @@ For `no_proof_found`, the database keeps the TapLeaf hash, output key, original
 script size, revelation location, analyzer version, search configuration, and
 status, but clears the full script, Merkle-path JSON, annex, and observed
 witness. Candidate/confirmed weaknesses plus `inconclusive` and
-`invalid_script` outcomes retain complete evidence.
+`invalid_script` outcomes retain complete evidence. Weakness evidence also
+records the proof strategy; older databases are migrated with
+`legacy_unspecified` for proofs created before that field existed.
 
 ### Inspect scan status
 
@@ -279,7 +298,9 @@ cargo run --release -- \
 ```
 
 A report contains only candidate weak leaves whose Taproot output key currently
-has at least one unspent output in the scanner's local view.
+has at least one unspent output in the scanner's local view. Each item includes
+the concrete proof witness and `proof_strategy` alongside consensus, policy,
+validator, and limitation evidence.
 
 ## Detection statuses
 
@@ -292,8 +313,10 @@ has at least one unspent output in the scanner's local view.
 | `invalid_script` | The script could not be parsed by the analyzer. |
 
 The database persists every analyzed `0xc0` leaf, including analyzer version,
-search configuration, consensus status, policy status, validator, and details.
-Reports include candidate and confirmed weak leaves only.
+the configured bounded search strategies and limits, consensus status, policy
+status, validator, and details. Candidate and confirmed results additionally
+retain their proof strategy. Reports include candidate and confirmed weak
+leaves only.
 
 ## Current project status
 
@@ -310,8 +333,11 @@ The repository is a functional research prototype:
   and asserts that revealing transaction
   `56f4c8b2c11ce6010637f8f831ad03430bc1686fc39d4833ec0281ddbef01a22`
   is persisted as `candidate_weak`.
+- Initial bounded search-space expansion covers small numbers, script constants,
+  and observed signature-shaped witness items.
 - Broader differential and reorganization tests, transaction-context semantics,
-  search-space expansion, and mainnet-scale benchmarks are still needed.
+  preimage/structured-witness search, and mainnet-scale benchmarks are still
+  needed.
 
 Do not use the current scanner unattended against an irreplaceable database.
 Keep backups and validate findings independently.

@@ -9,7 +9,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 
 use crate::{
-    analyzer::{ANALYZER_VERSION, AnalysisStatus, SEARCH_WITNESS_ATOMS, analyze_script},
+    analyzer::{
+        ANALYZER_VERSION, AnalysisStatus, MAX_SCRIPT_DERIVED_ATOMS, RICH_SEARCH_MAX_DEPTH,
+        SEARCH_STRATEGIES, SEARCH_WITNESS_ATOMS, analyze_script_with_observed_witness,
+    },
     detection::{
         CandidateValidator, ConsensusStatus, DetectionStatus, PolicyStatus, ValidationEvidence,
     },
@@ -106,6 +109,7 @@ pub struct RiskItem {
     pub vulnerable_script: String,
     pub vulnerability_class: String,
     pub proof_witness: Vec<String>,
+    pub proof_strategy: String,
     pub execution_trace: serde_json::Value,
     pub first_revealed_txid: String,
     pub detection_status: String,
@@ -210,6 +214,7 @@ impl Database {
                 tapleaf_id INTEGER PRIMARY KEY REFERENCES tapleaves(id) ON DELETE CASCADE,
                 vulnerability_class TEXT NOT NULL,
                 proof_witness_json TEXT NOT NULL,
+                proof_strategy TEXT NOT NULL DEFAULT 'legacy_unspecified',
                 execution_trace_json TEXT NOT NULL,
                 limitations_json TEXT NOT NULL
             );
@@ -241,6 +246,12 @@ impl Database {
             "tapleaves",
             "evidence_retained",
             "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        ensure_column(
+            &self.conn,
+            "weaknesses",
+            "proof_strategy",
+            "TEXT NOT NULL DEFAULT 'legacy_unspecified'",
         )?;
         self.conn.execute(
             "UPDATE tapleaves
@@ -470,13 +481,18 @@ impl Database {
                         )?;
 
                         if reveal.leaf_version == 0xc0 {
-                            let analysis = analyze_script(&reveal.script, max_witness_items);
+                            let analysis = analyze_script_with_observed_witness(
+                                &reveal.script,
+                                max_witness_items,
+                                &reveal.initial_stack,
+                            );
                             let evidence = if matches!(analysis.status, AnalysisStatus::Weak) {
+                                let proof_witness = analysis
+                                    .proof_witness
+                                    .as_deref()
+                                    .context("weak analysis result is missing its proof witness")?;
                                 if let Some(candidate_validator) = validator.as_deref_mut() {
-                                    let proof = analysis
-                                        .proof_witness
-                                        .as_deref()
-                                        .unwrap_or_default()
+                                    let proof = proof_witness
                                         .iter()
                                         .map(hex::decode)
                                         .collect::<Result<Vec<_>, _>>()?;
@@ -506,8 +522,34 @@ impl Database {
                             let search_config = serde_json::json!({
                                 "requested_max_witness_items": max_witness_items,
                                 "effective_max_witness_items": max_witness_items.min(12),
-                                "witness_atoms": SEARCH_WITNESS_ATOMS,
+                                "strategies": SEARCH_STRATEGIES,
+                                "boolean_witness_atoms": SEARCH_WITNESS_ATOMS,
+                                "rich_search_max_witness_items":
+                                    max_witness_items.min(12).min(RICH_SEARCH_MAX_DEPTH),
+                                "max_script_derived_atoms": MAX_SCRIPT_DERIVED_ATOMS,
+                                "observed_witness_source":
+                                    "verified_script_path_initial_stack",
+                                "observed_signature_lengths": [64, 65],
+                                "observed_signature_transforms": [
+                                    "empty_each",
+                                    "remove_each",
+                                    "empty_all",
+                                    "remove_all",
+                                ],
                             });
+                            let prior_detection_status = tx
+                                .query_row(
+                                    "SELECT detection_status FROM analysis_runs WHERE tapleaf_id=?1",
+                                    [tapleaf_id],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .optional()?;
+                            let should_replace_weakness = prior_detection_status.as_deref()
+                                != Some("confirmed_weak")
+                                || matches!(
+                                    evidence.detection_status,
+                                    DetectionStatus::ConfirmedWeak
+                                );
                             tx.execute(
                                 r#"
                                 INSERT INTO analysis_runs(
@@ -520,7 +562,9 @@ impl Database {
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                           OR (
                                             analysis_runs.detection_status='candidate_weak'
-                                            AND excluded.detection_status<>'confirmed_weak'
+                                            AND excluded.detection_status NOT IN (
+                                                'candidate_weak', 'confirmed_weak'
+                                            )
                                           )
                                         THEN analysis_runs.analysis_status
                                         ELSE excluded.analysis_status
@@ -529,7 +573,9 @@ impl Database {
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                         THEN analysis_runs.detection_status
                                         WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status<>'confirmed_weak'
+                                          AND excluded.detection_status NOT IN (
+                                              'candidate_weak', 'confirmed_weak'
+                                          )
                                         THEN analysis_runs.detection_status
                                         ELSE excluded.detection_status
                                     END,
@@ -537,7 +583,9 @@ impl Database {
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                           OR (
                                             analysis_runs.detection_status='candidate_weak'
-                                            AND excluded.detection_status<>'confirmed_weak'
+                                            AND excluded.detection_status NOT IN (
+                                                'candidate_weak', 'confirmed_weak'
+                                            )
                                           )
                                         THEN analysis_runs.analyzer_version
                                         ELSE excluded.analyzer_version
@@ -546,7 +594,9 @@ impl Database {
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                           OR (
                                             analysis_runs.detection_status='candidate_weak'
-                                            AND excluded.detection_status<>'confirmed_weak'
+                                            AND excluded.detection_status NOT IN (
+                                                'candidate_weak', 'confirmed_weak'
+                                            )
                                           )
                                         THEN analysis_runs.search_config_json
                                         ELSE excluded.search_config_json
@@ -555,7 +605,9 @@ impl Database {
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                         THEN analysis_runs.consensus_status
                                         WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status<>'confirmed_weak'
+                                          AND excluded.detection_status NOT IN (
+                                              'candidate_weak', 'confirmed_weak'
+                                          )
                                         THEN analysis_runs.consensus_status
                                         ELSE excluded.consensus_status
                                     END,
@@ -563,7 +615,9 @@ impl Database {
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                         THEN analysis_runs.policy_status
                                         WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status<>'confirmed_weak'
+                                          AND excluded.detection_status NOT IN (
+                                              'candidate_weak', 'confirmed_weak'
+                                          )
                                         THEN analysis_runs.policy_status
                                         ELSE excluded.policy_status
                                     END,
@@ -571,7 +625,9 @@ impl Database {
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                         THEN analysis_runs.validator
                                         WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status<>'confirmed_weak'
+                                          AND excluded.detection_status NOT IN (
+                                              'candidate_weak', 'confirmed_weak'
+                                          )
                                         THEN analysis_runs.validator
                                         ELSE excluded.validator
                                     END,
@@ -579,7 +635,9 @@ impl Database {
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                         THEN analysis_runs.validation_details
                                         WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status<>'confirmed_weak'
+                                          AND excluded.detection_status NOT IN (
+                                              'candidate_weak', 'confirmed_weak'
+                                          )
                                         THEN analysis_runs.validation_details
                                         ELSE excluded.validation_details
                                     END,
@@ -587,7 +645,9 @@ impl Database {
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                           OR (
                                             analysis_runs.detection_status='candidate_weak'
-                                            AND excluded.detection_status<>'confirmed_weak'
+                                            AND excluded.detection_status NOT IN (
+                                                'candidate_weak', 'confirmed_weak'
+                                            )
                                           )
                                         THEN analysis_runs.analyzed_at_unix
                                         ELSE excluded.analyzed_at_unix
@@ -621,28 +681,41 @@ impl Database {
                             }
                             if matches!(analysis.status, AnalysisStatus::Weak) {
                                 counts.weak_scripts += 1;
-                                tx.execute(
-                                    r#"
-                                    INSERT INTO weaknesses(
-                                        tapleaf_id, vulnerability_class, proof_witness_json,
-                                        execution_trace_json, limitations_json
-                                    ) VALUES (?1, ?2, ?3, ?4, ?5)
-                                    ON CONFLICT(tapleaf_id) DO UPDATE SET
-                                        vulnerability_class=excluded.vulnerability_class,
-                                        proof_witness_json=excluded.proof_witness_json,
-                                        execution_trace_json=excluded.execution_trace_json,
-                                        limitations_json=excluded.limitations_json
-                                    "#,
-                                    params![
-                                        tapleaf_id,
-                                        analysis.vulnerability_class.unwrap_or_default(),
-                                        serde_json::to_string(
-                                            &analysis.proof_witness.unwrap_or_default()
-                                        )?,
-                                        serde_json::to_string(&analysis.execution_trace)?,
-                                        serde_json::to_string(&analysis.limitations)?,
-                                    ],
-                                )?;
+                                if should_replace_weakness {
+                                    let vulnerability_class = analysis
+                                        .vulnerability_class
+                                        .as_deref()
+                                        .context("weak analysis result is missing its class")?;
+                                    let proof_witness = analysis.proof_witness.as_deref().context(
+                                        "weak analysis result is missing its proof witness",
+                                    )?;
+                                    let proof_strategy =
+                                        analysis.proof_strategy.as_deref().context(
+                                            "weak analysis result is missing its proof strategy",
+                                        )?;
+                                    tx.execute(
+                                        r#"
+                                        INSERT INTO weaknesses(
+                                            tapleaf_id, vulnerability_class, proof_witness_json,
+                                            proof_strategy, execution_trace_json, limitations_json
+                                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                                        ON CONFLICT(tapleaf_id) DO UPDATE SET
+                                            vulnerability_class=excluded.vulnerability_class,
+                                            proof_witness_json=excluded.proof_witness_json,
+                                            proof_strategy=excluded.proof_strategy,
+                                            execution_trace_json=excluded.execution_trace_json,
+                                            limitations_json=excluded.limitations_json
+                                        "#,
+                                        params![
+                                            tapleaf_id,
+                                            vulnerability_class,
+                                            serde_json::to_string(proof_witness)?,
+                                            proof_strategy,
+                                            serde_json::to_string(&analysis.execution_trace)?,
+                                            serde_json::to_string(&analysis.limitations)?,
+                                        ],
+                                    )?;
+                                }
                             }
                             if effective_detection_status == "no_proof_found" {
                                 let has_prior_weakness: bool = tx.query_row(
@@ -1000,7 +1073,7 @@ impl Database {
             SELECT
                 l.id, hex(l.output_key), hex(l.script),
                 w.vulnerability_class, w.proof_witness_json,
-                w.execution_trace_json, w.limitations_json,
+                w.proof_strategy, w.execution_trace_json, w.limitations_json,
                 a.detection_status, a.consensus_status, a.policy_status,
                 a.validator, a.validation_details,
                 (
@@ -1027,8 +1100,9 @@ impl Database {
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
                 row.get::<_, String>(10)?,
-                row.get::<_, Option<String>>(11)?,
-                row.get::<_, String>(12)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, String>(13)?,
             ))
         })?;
         let mut risks = Vec::new();
@@ -1039,6 +1113,7 @@ impl Database {
                 script,
                 class,
                 proof_json,
+                proof_strategy,
                 trace_json,
                 limitations_json,
                 detection_status,
@@ -1087,6 +1162,7 @@ impl Database {
                 vulnerable_script: script.to_lowercase(),
                 vulnerability_class: class,
                 proof_witness: serde_json::from_str(&proof_json)?,
+                proof_strategy,
                 execution_trace: serde_json::from_str(&trace_json)?,
                 first_revealed_txid: first_txid,
                 detection_status: detection_status.clone(),
@@ -1271,9 +1347,11 @@ fn optional_meta_u64(conn: &Connection, key: &str) -> Result<Option<u64>> {
 mod tests {
     use std::collections::HashMap;
 
+    use sha2::{Digest, Sha256};
     use tempfile::NamedTempFile;
 
     use crate::{
+        analyzer::analyze_script,
         rpc::{BtcAmount, ScriptPubKey, Transaction as RpcTransaction, TxIn, TxOut},
         taproot::single_leaf_commitment,
     };
@@ -1292,6 +1370,42 @@ mod tests {
         let state = db.scan_state().unwrap().unwrap();
         assert_eq!(state.chain, "regtest");
         assert_eq!(state.target_height, 100);
+    }
+
+    #[test]
+    fn migrates_legacy_weakness_rows_with_an_explicit_unknown_strategy() {
+        let file = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE weaknesses (
+                    tapleaf_id INTEGER PRIMARY KEY,
+                    vulnerability_class TEXT NOT NULL,
+                    proof_witness_json TEXT NOT NULL,
+                    execution_trace_json TEXT NOT NULL,
+                    limitations_json TEXT NOT NULL
+                );
+                INSERT INTO weaknesses(
+                    tapleaf_id, vulnerability_class, proof_witness_json,
+                    execution_trace_json, limitations_json
+                ) VALUES (1, 'signatureless_satisfaction', '[]', '[]', '[]');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(file.path()).unwrap();
+        let strategy: String = db
+            .conn
+            .query_row(
+                "SELECT proof_strategy FROM weaknesses WHERE tapleaf_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(strategy, "legacy_unspecified");
     }
 
     #[test]
@@ -1474,6 +1588,137 @@ mod tests {
     }
 
     #[test]
+    fn observed_initial_stack_strategy_is_persisted_and_reported() {
+        let file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(file.path()).unwrap();
+        db.prepare_scan("regtest", 0, 2, 0, 144).unwrap();
+        let mut index = HashMap::new();
+
+        let data = b"observed-data".to_vec();
+        let digest = Sha256::digest(&data);
+        let script = [vec![0x75, 0xa8, 0x20], digest.to_vec(), vec![0x87]].concat();
+        assert!(matches!(
+            analyze_script(&script, 2).status,
+            AnalysisStatus::NoProofFound
+        ));
+        let commitment = single_leaf_commitment(&script).unwrap();
+        let funding_txid = "81".repeat(32);
+        let block0 = Block {
+            hash: "82".repeat(32),
+            height: 0,
+            previousblockhash: None,
+            tx: vec![RpcTransaction {
+                txid: funding_txid.clone(),
+                vin: vec![],
+                vout: vec![TxOut {
+                    value: BtcAmount(10_000),
+                    n: 0,
+                    script_pub_key: ScriptPubKey {
+                        hex: format!("5120{}", hex::encode(commitment.output_key)),
+                    },
+                }],
+            }],
+        };
+        db.commit_block(&block0, 0, 2, 144, &mut index, None)
+            .unwrap();
+
+        let block1 = Block {
+            hash: "83".repeat(32),
+            height: 1,
+            previousblockhash: Some(block0.hash.clone()),
+            tx: vec![RpcTransaction {
+                txid: "84".repeat(32),
+                vin: vec![TxIn {
+                    txid: Some(funding_txid),
+                    vout: Some(0),
+                    coinbase: None,
+                    txinwitness: vec![
+                        hex::encode(&data),
+                        "42".repeat(64),
+                        hex::encode(&script),
+                        hex::encode(&commitment.control_block),
+                    ],
+                }],
+                vout: vec![TxOut {
+                    value: BtcAmount(9_000),
+                    n: 0,
+                    script_pub_key: ScriptPubKey {
+                        hex: format!("5120{}", hex::encode(commitment.output_key)),
+                    },
+                }],
+            }],
+        };
+
+        let counts = db
+            .commit_block(&block1, 0, 2, 144, &mut index, None)
+            .unwrap();
+
+        assert_eq!(counts.candidate_weak_scripts, 1);
+        let block2 = Block {
+            hash: "85".repeat(32),
+            height: 2,
+            previousblockhash: Some(block1.hash.clone()),
+            tx: vec![RpcTransaction {
+                txid: "86".repeat(32),
+                vin: vec![TxIn {
+                    txid: Some("84".repeat(32)),
+                    vout: Some(0),
+                    coinbase: None,
+                    txinwitness: vec![
+                        hex::encode(&data),
+                        "42".repeat(64),
+                        hex::encode(&script),
+                        hex::encode(&commitment.control_block),
+                    ],
+                }],
+                vout: vec![TxOut {
+                    value: BtcAmount(8_000),
+                    n: 0,
+                    script_pub_key: ScriptPubKey {
+                        hex: format!("5120{}", hex::encode(commitment.output_key)),
+                    },
+                }],
+            }],
+        };
+        let refreshed_counts = db
+            .commit_block(&block2, 0, 3, 144, &mut index, None)
+            .unwrap();
+        assert_eq!(refreshed_counts.candidate_weak_scripts, 1);
+
+        let stored: (String, String, String) = db
+            .conn
+            .query_row(
+                "SELECT w.proof_strategy, w.proof_witness_json, a.search_config_json
+                 FROM weaknesses w
+                 JOIN analysis_runs a ON a.tapleaf_id=w.tapleaf_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, "observed_signature_removal");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&stored.1).unwrap(),
+            vec![hex::encode(&data), String::new()]
+        );
+        let search_config: serde_json::Value = serde_json::from_str(&stored.2).unwrap();
+        assert_eq!(
+            search_config["strategies"],
+            serde_json::json!(SEARCH_STRATEGIES)
+        );
+        assert_eq!(
+            search_config["observed_witness_source"],
+            "verified_script_path_initial_stack"
+        );
+        assert_eq!(search_config["requested_max_witness_items"], 3);
+        assert_eq!(search_config["rich_search_max_witness_items"], 3);
+
+        let report = db.report().unwrap();
+        assert_eq!(report.risks.len(), 1);
+        assert_eq!(report.risks[0].proof_strategy, "observed_signature_removal");
+        assert_eq!(report.risks[0].detection_status, "candidate_weak");
+    }
+
+    #[test]
     fn candidate_weak_leaf_matches_later_unspent_output_key() {
         let file = NamedTempFile::new().unwrap();
         let mut db = Database::open(file.path()).unwrap();
@@ -1637,6 +1882,13 @@ mod tests {
                 [],
             )
             .unwrap();
+        db.conn
+            .execute(
+                "UPDATE weaknesses SET proof_strategy='confirmed_strategy'
+                 WHERE tapleaf_id=(SELECT id FROM tapleaves LIMIT 1)",
+                [],
+            )
+            .unwrap();
         let block4 = Block {
             hash: "a4".repeat(32),
             height: 709_635,
@@ -1667,10 +1919,12 @@ mod tests {
         let block4_counts = db
             .commit_block(&block4, 709_632, 4, 144, &mut index, None)
             .unwrap();
+        assert_eq!(block4_counts.weak_scripts, 1);
         assert_eq!(block4_counts.candidate_weak_scripts, 0);
         assert_eq!(block4_counts.confirmed_weak_scripts, 1);
         let report = db.report().unwrap();
         assert_eq!(report.risks[0].detection_status, "confirmed_weak");
         assert_eq!(report.risks[0].validator, "test-validator");
+        assert_eq!(report.risks[0].proof_strategy, "confirmed_strategy");
     }
 }

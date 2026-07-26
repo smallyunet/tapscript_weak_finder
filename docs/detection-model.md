@@ -35,6 +35,7 @@ The report includes:
 - vulnerable script;
 - vulnerability class;
 - proof witness;
+- proof strategy;
 - execution trace;
 - first revealing transaction;
 - analyzer limitations.
@@ -45,15 +46,15 @@ validator promotes it to `confirmed_weak`.
 
 ## Search space
 
-The current witness alphabet is:
+The analyzer runs three bounded strategies in order. It returns the first
+candidate that succeeds in the custom executor and records that strategy with
+the proof.
 
-| Atom | Encoding | Purpose |
-| --- | --- | --- |
-| False/empty | empty byte vector | Empty signature, false condition, or empty data. |
-| Minimally true | `01` | True condition or small numeric value. |
+### Boolean exhaustive search
 
-For a configured maximum depth `n`, the analyzer searches every binary
-combination at depths `0..n`. The implementation caps `n` at 12.
+For a configured maximum depth `n`, this strategy searches every combination of
+empty and minimally true (`01`) items at depths `0..n`. The implementation caps
+`n` at 12.
 
 This strategy is well suited to mistakes such as:
 
@@ -62,13 +63,53 @@ This strategy is well suited to mistakes such as:
 - conditional branches whose stack effects were misunderstood;
 - simple stack-manipulation errors.
 
-It will miss satisfactions requiring arbitrary:
+### Small numbers and script constants
+
+The second strategy adds:
+
+- negative zero as a false boolean atom;
+- minimally encoded `-1` and integers `2` through `16`;
+- up to eight unique values, no larger than 520 bytes, pushed by the script.
+
+It searches combinations only through `min(n, 3)` witness items. Script-derived
+atoms can discover paths that require the same byte string as an already-pushed
+constant, but they do not recover unknown preimages.
+
+### Observed signature removal
+
+During chain scanning, BIP 341 commitment parsing provides the verified
+TapScript initial stack after removing the optional annex, script, and control
+block. The analyzer treats 64- and 65-byte items as signature-shaped and tries:
+
+- emptying each such item individually;
+- removing each such item individually;
+- emptying all such items together;
+- removing all such items together.
+
+Candidates that still exceed the configured witness-item limit are skipped.
+The strategy does not enumerate every mixed subset of empty/remove
+transformations. Length is only a heuristic for generating candidates; it does
+not prove that the observed item was a valid signature.
+
+The standalone `analyze-script` command does not receive an observed transaction
+witness, so this strategy has no candidates there.
+
+### Persisted search coverage
+
+For each analysis the database records the requested and effective boolean
+depth, rich-search depth, strategy names, atom limits, observed-witness source,
+signature-shaped lengths, and transformations. It does not store a list of
+every dynamically generated candidate or script-derived atom.
+
+The combined bounded search can still miss satisfactions requiring:
 
 - hashes or preimages;
-- byte strings;
-- encoded numbers other than empty or one;
+- byte strings that are neither selected script constants nor retained observed
+  stack items;
+- encoded numbers outside the small set unless the script pushes them;
 - locktime or sequence values;
-- larger or structured witnesses outside the configured depth.
+- larger or structured witnesses outside the configured depths;
+- mixed observed-signature transformations not listed above.
 
 ## Status semantics
 
@@ -88,8 +129,10 @@ and policy, a generic rejection leaves both layers inconclusive unless
 additional evidence separates them.
 
 A persisted candidate is not downgraded merely because a later run uses a
-smaller search bound and fails to rediscover its proof. A later authoritative
-validation may still promote it to `confirmed_weak`.
+smaller search bound or otherwise fails to rediscover its proof. A later
+candidate refreshes the proof and matching search metadata together, while an
+authoritative validation may promote it to `confirmed_weak`. Once confirmed,
+later local candidate generation does not replace its authoritative evidence.
 
 ### `no_proof_found`
 
@@ -132,6 +175,10 @@ or model mismatch and should be investigated.
 
 The latter two classes need especially careful communication: consensus
 validity, standard relay policy, and future soft-fork behavior are distinct.
+
+Every retained weakness also stores `proof_strategy`. Databases created before
+that field existed are migrated with `legacy_unspecified`; this label means the
+historical strategy is unknown, not that the proof was regenerated.
 
 ## Current semantic gaps
 
@@ -209,8 +256,11 @@ A weak script may be missed if:
 
 - it has never been revealed;
 - its output key is not reused;
-- its witness requires atoms outside the current binary alphabet;
-- it requires more than 12 witness items;
+- its witness requires atoms outside all configured strategies;
+- its boolean proof requires more than 12 witness items;
+- its rich-atom proof requires more than three witness items;
+- it requires an unsearched mixture of observed signature removals and
+  emptyings;
 - execution reaches an unsupported opcode;
 - the scan begins after creation of relevant P2TR outputs;
 - the node or scan database does not cover the canonical history completely.
