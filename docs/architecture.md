@@ -235,6 +235,8 @@ erDiagram
         blob tapleaf_hash
         integer leaf_version
         blob script
+        integer script_size
+        integer evidence_retained
         blob control_block
     }
 
@@ -277,6 +279,22 @@ rows remain until spent; spent rows remain only inside the reorganization
 window and are then deleted. `scanned_blocks` contains hashes and aggregate
 counts, not block bodies. Revelation and analysis tables retain the evidence
 needed to reproduce detection results.
+
+Rows classified as `no_proof_found` retain coverage metadata but compact large
+evidence fields: the script is represented by its committed TapLeaf hash and
+original byte length, while observed witness, annex, and Merkle-path JSON are
+cleared. Weaknesses and abnormal outcomes (`inconclusive` or `invalid_script`)
+retain the full evidence needed for review. Re-observing a compacted leaf
+temporarily restores its script from RPC before analysis, so a later analyzer
+version can still promote it to a retained finding.
+
+RPC response bodies are fed directly into the JSON deserializer through a
+configured byte-limited reader. This bounds the raw input buffering but is not
+a strict whole-process RSS limit: the decoded block representation also
+requires memory. The separate P2TR-index entry limit is checked before loading
+the persisted index and after every committed block. Disk free space is checked
+immediately before block download and again before the block transaction
+begins.
 
 ## Trust boundaries
 

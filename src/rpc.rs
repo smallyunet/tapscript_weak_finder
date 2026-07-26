@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{self, Read},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -42,6 +43,7 @@ pub struct RpcOptions {
     pub max_retries: u32,
     pub retry_initial_delay: Duration,
     pub retry_max_delay: Duration,
+    pub max_response_bytes: u64,
 }
 
 impl Default for RpcOptions {
@@ -51,6 +53,7 @@ impl Default for RpcOptions {
             max_retries: 5,
             retry_initial_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
+            max_response_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -66,6 +69,9 @@ impl RpcClient {
         }
         if options.retry_max_delay < options.retry_initial_delay {
             bail!("RPC maximum retry delay must not be smaller than the initial delay");
+        }
+        if options.max_response_bytes == 0 {
+            bail!("RPC maximum response size must be greater than zero");
         }
         let auth = match auth {
             Auth::None => ResolvedAuth::None,
@@ -146,9 +152,25 @@ impl RpcClient {
             if !status.is_success() {
                 bail!("RPC {method} returned HTTP {status}");
             }
-            let envelope: RpcEnvelope<T> = match response.json() {
+            if response
+                .content_length()
+                .is_some_and(|length| length > self.options.max_response_bytes)
+            {
+                bail!(
+                    "RPC {method} response exceeds configured {} MiB limit",
+                    self.options.max_response_bytes / 1024 / 1024
+                );
+            }
+            let mut reader = LimitedReader::new(response, self.options.max_response_bytes);
+            let envelope: RpcEnvelope<T> = match serde_json::from_reader(&mut reader) {
                 Ok(envelope) => envelope,
                 Err(_error) => {
+                    if reader.exceeded() {
+                        bail!(
+                            "RPC {method} response exceeds configured {} MiB limit",
+                            self.options.max_response_bytes / 1024 / 1024
+                        );
+                    }
                     if self.retry(method, attempt, "invalid_response", None) {
                         continue;
                     }
@@ -217,6 +239,47 @@ impl RpcClient {
 
     pub fn block(&self, hash: &str) -> Result<Block> {
         self.call("getblock", json!([hash, 2]))
+    }
+}
+
+struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+    exceeded: bool,
+}
+
+impl<R> LimitedReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            exceeded: false,
+        }
+    }
+
+    fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
+            self.exceeded = true;
+            return Err(io::Error::other("RPC response size limit exceeded"));
+        }
+        let allowed = usize::try_from(self.remaining.min(buffer.len() as u64))
+            .expect("allowed read length fits usize");
+        let read = self.inner.read(&mut buffer[..allowed])?;
+        self.remaining -= read as u64;
+        Ok(read)
     }
 }
 
@@ -501,14 +564,34 @@ mod tests {
         assert!(!error.contains(&address.to_string()));
     }
 
+    #[test]
+    fn rejects_a_response_above_the_memory_guard_without_retrying() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":"oversized","error":null}"#;
+        let url = serve_responses(vec![json_response(body)]);
+        let mut options = test_options(3);
+        options.max_response_bytes = 16;
+        let client = RpcClient::with_options(url, Auth::None, options).unwrap();
+
+        let error = client
+            .call::<String>("test", json!([]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("response exceeds configured"));
+    }
+
     fn test_client(url: String, max_retries: u32) -> RpcClient {
-        RpcClient::with_options(url, Auth::None, RpcOptions {
+        RpcClient::with_options(url, Auth::None, test_options(max_retries)).unwrap()
+    }
+
+    fn test_options(max_retries: u32) -> RpcOptions {
+        RpcOptions {
             timeout: Duration::from_secs(2),
             max_retries,
             retry_initial_delay: Duration::ZERO,
             retry_max_delay: Duration::ZERO,
-        })
-        .unwrap()
+            max_response_bytes: 1024 * 1024,
+        }
     }
 
     fn json_response(body: &str) -> String {

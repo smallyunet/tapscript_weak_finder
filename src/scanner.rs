@@ -23,6 +23,8 @@ pub struct ScanConfig {
     pub progress_mode: ProgressMode,
     pub max_witness_items: usize,
     pub reorg_retention_blocks: u64,
+    pub min_free_disk_bytes: u64,
+    pub max_in_memory_p2tr_utxos: usize,
 }
 
 pub struct Scanner<'a> {
@@ -73,7 +75,9 @@ impl<'a> Scanner<'a> {
 
         self.reconcile_reorg(&mut state)?;
         state = self.db.scan_state()?.context("scan state disappeared")?;
-        let mut unspent_index = self.db.load_unspent_index()?;
+        let mut unspent_index = self
+            .db
+            .load_unspent_index(self.config.max_in_memory_p2tr_utxos)?;
         let status = self.db.status()?;
         let mut progress = ProgressReporter::new(
             self.config.progress_mode,
@@ -96,6 +100,8 @@ impl<'a> Scanner<'a> {
                 progress.finish(true);
                 return Ok(());
             }
+            self.db
+                .ensure_min_free_space(self.config.min_free_disk_bytes)?;
             let hash = self
                 .rpc
                 .block_hash(height)
@@ -112,6 +118,8 @@ impl<'a> Scanner<'a> {
                     bail!("chain changed while scanning at height {height}; restart to reconcile");
                 }
             }
+            self.db
+                .ensure_min_free_space(self.config.min_free_disk_bytes)?;
             let counts = self.db.commit_block(
                 &block,
                 activation_height,
@@ -121,6 +129,16 @@ impl<'a> Scanner<'a> {
                 self.validator.as_deref_mut(),
             )?;
             progress.block_committed(height, &hash, counts, block_started.elapsed().as_millis());
+            if self.config.max_in_memory_p2tr_utxos > 0
+                && unspent_index.len() > self.config.max_in_memory_p2tr_utxos
+            {
+                bail!(
+                    "P2TR memory guard stopped the scan after committing height {height}: \
+                     {} unspent entries, configured limit {}",
+                    unspent_index.len(),
+                    self.config.max_in_memory_p2tr_utxos
+                );
+            }
             state.last_block_hash = Some(hash);
             state.next_height = height + 1;
             height += 1;

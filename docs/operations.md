@@ -55,7 +55,26 @@ environment variables:
 --rpc-max-retries / BITCOIN_RPC_MAX_RETRIES
 --rpc-retry-initial-ms / BITCOIN_RPC_RETRY_INITIAL_MS
 --rpc-retry-max-ms / BITCOIN_RPC_RETRY_MAX_MS
+--rpc-max-response-mib / BITCOIN_RPC_MAX_RESPONSE_MIB
+--min-free-disk-mib / TAPSCRIPT_MIN_FREE_DISK_MIB
+--max-in-memory-p2tr-utxos / TAPSCRIPT_MAX_IN_MEMORY_P2TR_UTXOS
 ```
+
+`--rpc-max-response-mib` defaults to 64 MiB. Responses above the limit are not
+retried because raising the limit is an operator decision. JSON is parsed from
+the limited stream without first copying the complete response into a second
+buffer.
+
+`--min-free-disk-mib` defaults to 1024 MiB. The scanner checks the filesystem
+containing the SQLite database before fetching and before committing every
+block. Falling below the threshold stops the run at the last durable
+checkpoint. Setting the disk threshold to zero disables only this guard.
+
+`--max-in-memory-p2tr-utxos` defaults to 1,000,000 entries. The scanner checks
+the persisted count before allocating the startup HashMap and checks the live
+count after each committed block. Crossing the limit stops at that durable
+height; increase the limit only after confirming the host has enough memory.
+Zero disables this entry-count guard.
 
 ## Scan ranges and coverage
 
@@ -121,6 +140,8 @@ Important status fields:
 | `analyzed_scripts` | Revealed `0xc0` leaves with persisted analysis coverage. |
 | `confirmed_weak_scripts` | Candidates accepted by the isolated Core validator. |
 | `candidate_weak_scripts` | Candidates without conclusive Core acceptance. |
+| `retained_evidence_scripts` | TapLeaves whose complete script evidence remains stored. |
+| `compacted_no_proof_scripts` | `no_proof_found` TapLeaves retained as summaries. |
 | `current_p2tr_utxos` | Unspent P2TR outputs known to this database. |
 | `reorg_retention_blocks` | Configured number of recent blocks whose spent P2TR state is retained. |
 | `oldest_reorg_safe_height` | Oldest block that can currently be rolled back without rebuilding. |
@@ -233,6 +254,14 @@ The database does not retain complete block or transaction JSON. It stores:
 - verified revelation and analysis evidence;
 - the durable resume checkpoint.
 
+Full scripts and witnesses are retained for candidate/confirmed weaknesses,
+`inconclusive`, and `invalid_script`. A `no_proof_found` row keeps coverage and
+provenance summaries—including TapLeaf hash, original script size, revelation
+transaction/block, analyzer version, and search configuration—but clears its
+large script/witness evidence. Existing databases are compacted on their next
+open. SQLite reuses freed pages, but run `VACUUM` only during planned downtime
+if physically shrinking an existing file is necessary.
+
 The default `--reorg-retention-blocks 144` deletes spent P2TR rows once they
 fall outside the rollback window. SQLite reuses those pages for later writes;
 deleting rows does not necessarily shrink the existing file immediately. A
@@ -251,6 +280,7 @@ The current scanner is deliberately simple:
 - one height at a time;
 - one `getblockhash` request per height;
 - one decoded `getblock` request per block;
+- one configured response-size guard per RPC body;
 - one in-memory entry per currently unspent tracked P2TR output;
 - one SQLite transaction per block.
 

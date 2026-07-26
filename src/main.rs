@@ -78,6 +78,10 @@ struct ScanArgs {
     #[arg(long, env = "BITCOIN_RPC_RETRY_MAX_MS", default_value_t = 30_000)]
     rpc_retry_max_ms: u64,
 
+    /// Maximum RPC response-body size used as an input-memory guard.
+    #[arg(long, env = "BITCOIN_RPC_MAX_RESPONSE_MIB", default_value_t = 64)]
+    rpc_max_response_mib: u64,
+
     /// Defaults to zero so the local P2TR UTXO view is complete.
     #[arg(long, default_value_t = 0)]
     start_height: u64,
@@ -100,6 +104,18 @@ struct ScanArgs {
     /// Keep spent P2TR rows only for this many recent blocks of reorg rollback.
     #[arg(long, default_value_t = 144)]
     reorg_retention_blocks: u64,
+
+    /// Stop before fetching or committing a block when less disk is available.
+    #[arg(long, env = "TAPSCRIPT_MIN_FREE_DISK_MIB", default_value_t = 1_024)]
+    min_free_disk_mib: u64,
+
+    /// Stop when the in-memory unspent P2TR index exceeds this entry count.
+    #[arg(
+        long,
+        env = "TAPSCRIPT_MAX_IN_MEMORY_P2TR_UTXOS",
+        default_value_t = 1_000_000
+    )]
+    max_in_memory_p2tr_utxos: usize,
 
     /// Validate candidates using a fresh, isolated Bitcoin Core regtest node.
     #[arg(long, default_value_t = false)]
@@ -169,6 +185,10 @@ fn main() -> Result<()> {
                 max_retries: args.rpc_max_retries,
                 retry_initial_delay: Duration::from_millis(args.rpc_retry_initial_ms),
                 retry_max_delay: Duration::from_millis(args.rpc_retry_max_ms),
+                max_response_bytes: mib_to_bytes(
+                    args.rpc_max_response_mib,
+                    "RPC maximum response",
+                )?,
             })?;
             let config = ScanConfig {
                 requested_start_height: args.start_height,
@@ -177,6 +197,8 @@ fn main() -> Result<()> {
                 progress_mode: args.output.into(),
                 max_witness_items: args.max_witness_items,
                 reorg_retention_blocks: args.reorg_retention_blocks,
+                min_free_disk_bytes: mib_to_bytes(args.min_free_disk_mib, "minimum free disk")?,
+                max_in_memory_p2tr_utxos: args.max_in_memory_p2tr_utxos,
             };
             let scanner = Scanner::new(rpc, &mut db, config);
             if args.verify_with_bitcoin_core {
@@ -237,4 +259,10 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn mib_to_bytes(value: u64, name: &str) -> Result<u64> {
+    value
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("{name} value is too large"))
 }

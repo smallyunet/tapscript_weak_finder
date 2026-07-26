@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +19,7 @@ use crate::{
 
 pub struct Database {
     conn: Connection,
+    path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -82,6 +83,8 @@ pub struct Status {
     pub no_proof_found_scripts: u64,
     pub inconclusive_scripts: u64,
     pub invalid_script_scripts: u64,
+    pub retained_evidence_scripts: u64,
+    pub compacted_no_proof_scripts: u64,
     pub current_p2tr_utxos: u64,
     pub current_p2tr_balance_sats: u64,
 }
@@ -122,7 +125,10 @@ impl Database {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        let db = Self { conn };
+        let db = Self {
+            conn,
+            path: path.to_owned(),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -177,6 +183,8 @@ impl Database {
                 tapleaf_hash BLOB NOT NULL,
                 leaf_version INTEGER NOT NULL,
                 script BLOB NOT NULL,
+                script_size INTEGER NOT NULL DEFAULT 0,
+                evidence_retained INTEGER NOT NULL DEFAULT 1,
                 control_block BLOB NOT NULL,
                 merkle_path_json TEXT NOT NULL,
                 UNIQUE(output_key, tapleaf_hash, control_block)
@@ -220,6 +228,48 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS analysis_runs_detection_status
                 ON analysis_runs(detection_status);
+            "#,
+        )?;
+        ensure_column(
+            &self.conn,
+            "tapleaves",
+            "script_size",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &self.conn,
+            "tapleaves",
+            "evidence_retained",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        self.conn.execute(
+            "UPDATE tapleaves
+             SET script_size=LENGTH(script)
+             WHERE script_size=0 AND LENGTH(script)>0",
+            [],
+        )?;
+        self.conn.execute_batch(
+            r#"
+            UPDATE revelation_events
+            SET observed_witness_json='[]', annex_hex=NULL
+            WHERE tapleaf_id IN (
+                SELECT a.tapleaf_id
+                FROM analysis_runs a
+                LEFT JOIN weaknesses w ON w.tapleaf_id=a.tapleaf_id
+                WHERE a.detection_status='no_proof_found'
+                  AND w.tapleaf_id IS NULL
+            )
+              AND (observed_witness_json<>'[]' OR annex_hex IS NOT NULL);
+            UPDATE tapleaves
+            SET script=X'', merkle_path_json='[]', evidence_retained=0
+            WHERE id IN (
+                SELECT a.tapleaf_id
+                FROM analysis_runs a
+                LEFT JOIN weaknesses w ON w.tapleaf_id=a.tapleaf_id
+                WHERE a.detection_status='no_proof_found'
+                  AND w.tapleaf_id IS NULL
+            )
+              AND evidence_retained<>0;
             "#,
         )?;
         Ok(())
@@ -366,9 +416,16 @@ impl Database {
                             r#"
                             INSERT INTO tapleaves(
                                 output_key, internal_key, tapleaf_hash, leaf_version,
-                                script, control_block, merkle_path_json
-                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                            ON CONFLICT(output_key, tapleaf_hash, control_block) DO NOTHING
+                                script, script_size, evidence_retained,
+                                control_block, merkle_path_json
+                            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)
+                            ON CONFLICT(output_key, tapleaf_hash, control_block) DO UPDATE SET
+                                internal_key=excluded.internal_key,
+                                leaf_version=excluded.leaf_version,
+                                script=excluded.script,
+                                script_size=excluded.script_size,
+                                evidence_retained=1,
+                                merkle_path_json=excluded.merkle_path_json
                             "#,
                             params![
                                 prevout.output_key.as_slice(),
@@ -376,6 +433,7 @@ impl Database {
                                 reveal.tapleaf_hash.as_slice(),
                                 reveal.leaf_version,
                                 reveal.script,
+                                reveal.script.len(),
                                 reveal.control_block,
                                 serde_json::to_string(&merkle_path)?,
                             ],
@@ -458,35 +516,82 @@ impl Database {
                                     policy_status, validator, validation_details, analyzed_at_unix
                                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                                 ON CONFLICT(tapleaf_id) DO UPDATE SET
-                                    analysis_status=excluded.analysis_status,
+                                    analysis_status=CASE
+                                        WHEN analysis_runs.detection_status='confirmed_weak'
+                                          OR (
+                                            analysis_runs.detection_status='candidate_weak'
+                                            AND excluded.detection_status<>'confirmed_weak'
+                                          )
+                                        THEN analysis_runs.analysis_status
+                                        ELSE excluded.analysis_status
+                                    END,
                                     detection_status=CASE
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                         THEN analysis_runs.detection_status
+                                        WHEN analysis_runs.detection_status='candidate_weak'
+                                          AND excluded.detection_status<>'confirmed_weak'
+                                        THEN analysis_runs.detection_status
                                         ELSE excluded.detection_status
                                     END,
-                                    analyzer_version=excluded.analyzer_version,
-                                    search_config_json=excluded.search_config_json,
+                                    analyzer_version=CASE
+                                        WHEN analysis_runs.detection_status='confirmed_weak'
+                                          OR (
+                                            analysis_runs.detection_status='candidate_weak'
+                                            AND excluded.detection_status<>'confirmed_weak'
+                                          )
+                                        THEN analysis_runs.analyzer_version
+                                        ELSE excluded.analyzer_version
+                                    END,
+                                    search_config_json=CASE
+                                        WHEN analysis_runs.detection_status='confirmed_weak'
+                                          OR (
+                                            analysis_runs.detection_status='candidate_weak'
+                                            AND excluded.detection_status<>'confirmed_weak'
+                                          )
+                                        THEN analysis_runs.search_config_json
+                                        ELSE excluded.search_config_json
+                                    END,
                                     consensus_status=CASE
                                         WHEN analysis_runs.detection_status='confirmed_weak'
+                                        THEN analysis_runs.consensus_status
+                                        WHEN analysis_runs.detection_status='candidate_weak'
+                                          AND excluded.detection_status<>'confirmed_weak'
                                         THEN analysis_runs.consensus_status
                                         ELSE excluded.consensus_status
                                     END,
                                     policy_status=CASE
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                         THEN analysis_runs.policy_status
+                                        WHEN analysis_runs.detection_status='candidate_weak'
+                                          AND excluded.detection_status<>'confirmed_weak'
+                                        THEN analysis_runs.policy_status
                                         ELSE excluded.policy_status
                                     END,
                                     validator=CASE
                                         WHEN analysis_runs.detection_status='confirmed_weak'
+                                        THEN analysis_runs.validator
+                                        WHEN analysis_runs.detection_status='candidate_weak'
+                                          AND excluded.detection_status<>'confirmed_weak'
                                         THEN analysis_runs.validator
                                         ELSE excluded.validator
                                     END,
                                     validation_details=CASE
                                         WHEN analysis_runs.detection_status='confirmed_weak'
                                         THEN analysis_runs.validation_details
+                                        WHEN analysis_runs.detection_status='candidate_weak'
+                                          AND excluded.detection_status<>'confirmed_weak'
+                                        THEN analysis_runs.validation_details
                                         ELSE excluded.validation_details
                                     END,
-                                    analyzed_at_unix=excluded.analyzed_at_unix
+                                    analyzed_at_unix=CASE
+                                        WHEN analysis_runs.detection_status='confirmed_weak'
+                                          OR (
+                                            analysis_runs.detection_status='candidate_weak'
+                                            AND excluded.detection_status<>'confirmed_weak'
+                                          )
+                                        THEN analysis_runs.analyzed_at_unix
+                                        ELSE excluded.analyzed_at_unix
+                                    END
                                 "#,
                                 params![
                                     tapleaf_id,
@@ -538,6 +643,18 @@ impl Database {
                                         serde_json::to_string(&analysis.limitations)?,
                                     ],
                                 )?;
+                            }
+                            if effective_detection_status == "no_proof_found" {
+                                let has_prior_weakness: bool = tx.query_row(
+                                    "SELECT EXISTS(
+                                        SELECT 1 FROM weaknesses WHERE tapleaf_id=?1
+                                    )",
+                                    [tapleaf_id],
+                                    |row| row.get(0),
+                                )?;
+                                if !has_prior_weakness {
+                                    compact_no_proof_evidence(&tx, tapleaf_id)?;
+                                }
                             }
                         }
                     }
@@ -620,7 +737,18 @@ impl Database {
         Ok(counts)
     }
 
-    pub fn load_unspent_index(&self) -> Result<HashMap<OutPoint, P2trPrevout>> {
+    pub fn load_unspent_index(&self, max_entries: usize) -> Result<HashMap<OutPoint, P2trPrevout>> {
+        let stored_entries: u64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM p2tr_outputs WHERE spent_height IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if max_entries > 0 && stored_entries > max_entries as u64 {
+            bail!(
+                "P2TR memory guard stopped the scan: {stored_entries} unspent entries, \
+                 configured limit {max_entries}"
+            );
+        }
         let mut statement = self.conn.prepare(
             "SELECT txid, vout, output_key FROM p2tr_outputs WHERE spent_height IS NULL",
         )?;
@@ -640,6 +768,28 @@ impl Database {
             index.insert(OutPoint::parse(&txid, vout)?, P2trPrevout { output_key });
         }
         Ok(index)
+    }
+
+    pub fn ensure_min_free_space(&self, required_bytes: u64) -> Result<()> {
+        if required_bytes == 0 || self.path == Path::new(":memory:") {
+            return Ok(());
+        }
+        let directory = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let available = fs2::available_space(directory)
+            .with_context(|| format!("check free space for {}", directory.display()))?;
+        if available < required_bytes {
+            bail!(
+                "disk guard stopped the scan: {} MiB free at {}, {} MiB required",
+                available / 1024 / 1024,
+                directory.display(),
+                required_bytes / 1024 / 1024
+            );
+        }
+        Ok(())
     }
 
     pub fn rollback_tip(&mut self) -> Result<Option<u64>> {
@@ -781,6 +931,14 @@ impl Database {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        let evidence_counts = self.conn.query_row(
+            "SELECT
+                COALESCE(SUM(evidence_retained<>0), 0),
+                COALESCE(SUM(evidence_retained=0), 0)
+             FROM tapleaves",
+            [],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+        )?;
 
         Ok(Status {
             chain: state.as_ref().map(|value| value.chain.clone()),
@@ -808,6 +966,8 @@ impl Database {
             no_proof_found_scripts: analysis_counts.3,
             inconclusive_scripts: analysis_counts.4,
             invalid_script_scripts: analysis_counts.5,
+            retained_evidence_scripts: evidence_counts.0,
+            compacted_no_proof_scripts: evidence_counts.1,
             current_p2tr_utxos: utxos,
             current_p2tr_balance_sats: balance,
         })
@@ -973,6 +1133,37 @@ fn prune_spent_reorg_state(
     Ok(())
 }
 
+fn compact_no_proof_evidence(tx: &Transaction<'_>, tapleaf_id: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE tapleaves
+         SET script=X'', merkle_path_json='[]', evidence_retained=0
+         WHERE id=?1",
+        [tapleaf_id],
+    )?;
+    tx.execute(
+        "UPDATE revelation_events
+         SET observed_witness_json='[]', annex_hex=NULL
+         WHERE tapleaf_id=?1",
+        [tapleaf_id],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for existing in columns {
+        if existing? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
+    Ok(())
+}
+
 fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO metadata(key,value) VALUES (?1,?2)
@@ -1061,7 +1252,10 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use crate::rpc::{BtcAmount, ScriptPubKey, Transaction as RpcTransaction, TxIn, TxOut};
+    use crate::{
+        rpc::{BtcAmount, ScriptPubKey, Transaction as RpcTransaction, TxIn, TxOut},
+        taproot::single_leaf_commitment,
+    };
 
     use super::*;
 
@@ -1077,6 +1271,39 @@ mod tests {
         let state = db.scan_state().unwrap().unwrap();
         assert_eq!(state.chain, "regtest");
         assert_eq!(state.target_height, 100);
+    }
+
+    #[test]
+    fn disk_guard_can_stop_before_database_writes() {
+        let file = NamedTempFile::new().unwrap();
+        let db = Database::open(file.path()).unwrap();
+
+        db.ensure_min_free_space(0).unwrap();
+        let error = db.ensure_min_free_space(u64::MAX).unwrap_err().to_string();
+
+        assert!(error.contains("disk guard stopped the scan"));
+    }
+
+    #[test]
+    fn p2tr_index_guard_checks_count_before_allocating_the_index() {
+        let file = NamedTempFile::new().unwrap();
+        let db = Database::open(file.path()).unwrap();
+        for vout in 0..2 {
+            db.conn
+                .execute(
+                    "INSERT INTO p2tr_outputs(
+                        txid, vout, output_key, value_sats,
+                        created_height, created_block_hash
+                     ) VALUES (?1, ?2, ?3, 1, 0, ?4)",
+                    params!["70".repeat(32), vout, [1u8; 32].as_slice(), "71".repeat(32)],
+                )
+                .unwrap();
+        }
+
+        let error = db.load_unspent_index(1).unwrap_err().to_string();
+
+        assert!(error.contains("P2TR memory guard stopped the scan"));
+        assert_eq!(db.load_unspent_index(0).unwrap().len(), 2);
     }
 
     #[test]
@@ -1147,6 +1374,85 @@ mod tests {
     }
 
     #[test]
+    fn no_proof_found_keeps_summary_but_compacts_large_evidence() {
+        let file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(file.path()).unwrap();
+        db.prepare_scan("regtest", 0, 1, 0, 144).unwrap();
+        let mut index = HashMap::new();
+        let script = [vec![0x20], vec![0x02; 32], vec![0xac], vec![0x61; 8_000]].concat();
+        let commitment = single_leaf_commitment(&script).unwrap();
+        let funding_txid = "31".repeat(32);
+        let block0 = Block {
+            hash: "40".repeat(32),
+            height: 0,
+            previousblockhash: None,
+            tx: vec![RpcTransaction {
+                txid: funding_txid.clone(),
+                vin: vec![],
+                vout: vec![TxOut {
+                    value: BtcAmount(1_000),
+                    n: 0,
+                    script_pub_key: ScriptPubKey {
+                        hex: format!("5120{}", hex::encode(commitment.output_key)),
+                    },
+                }],
+            }],
+        };
+        db.commit_block(&block0, 0, 4, 144, &mut index, None)
+            .unwrap();
+        let block1 = Block {
+            hash: "41".repeat(32),
+            height: 1,
+            previousblockhash: Some(block0.hash.clone()),
+            tx: vec![RpcTransaction {
+                txid: "32".repeat(32),
+                vin: vec![TxIn {
+                    txid: Some(funding_txid),
+                    vout: Some(0),
+                    coinbase: None,
+                    txinwitness: vec![
+                        "00".repeat(8_000),
+                        hex::encode(&script),
+                        hex::encode(commitment.control_block),
+                    ],
+                }],
+                vout: vec![],
+            }],
+        };
+
+        let counts = db
+            .commit_block(&block1, 0, 4, 144, &mut index, None)
+            .unwrap();
+
+        assert_eq!(counts.no_proof_found_scripts, 1);
+        let stored: (u64, u64, bool, String, String) = db
+            .conn
+            .query_row(
+                "SELECT
+                    LENGTH(l.script), l.script_size, l.evidence_retained,
+                    l.merkle_path_json, e.observed_witness_json
+                 FROM tapleaves l
+                 JOIN revelation_events e ON e.tapleaf_id=l.id",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored.0, 0);
+        assert_eq!(stored.1, script.len() as u64);
+        assert!(!stored.2);
+        assert_eq!(stored.3, "[]");
+        assert_eq!(stored.4, "[]");
+    }
+
+    #[test]
     fn candidate_weak_leaf_matches_later_unspent_output_key() {
         let file = NamedTempFile::new().unwrap();
         let mut db = Database::open(file.path()).unwrap();
@@ -1214,31 +1520,84 @@ mod tests {
         assert_eq!(block2_counts.analyzed_scripts, 1);
         assert_eq!(block2_counts.candidate_weak_scripts, 1);
         assert_eq!(block2_counts.confirmed_weak_scripts, 0);
+        let retained: (u64, bool, String) = db
+            .conn
+            .query_row(
+                "SELECT
+                    LENGTH(l.script), l.evidence_retained, e.observed_witness_json
+                 FROM tapleaves l
+                 JOIN revelation_events e ON e.tapleaf_id=l.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(retained.0 > 0);
+        assert!(retained.1);
+        assert_ne!(retained.2, "[]");
         assert!(db.report().unwrap().risks.is_empty());
 
+        let sticky_prev_txid = "55".repeat(32);
+        assert!(matches!(
+            analyze_script(&hex::decode(script).unwrap(), 1).status,
+            AnalysisStatus::NoProofFound
+        ));
+        index.insert(
+            OutPoint::parse(&sticky_prev_txid, 0).unwrap(),
+            P2trPrevout {
+                output_key: hex::decode(output_key).unwrap().try_into().unwrap(),
+            },
+        );
         let block3 = Block {
             hash: "a3".repeat(32),
             height: 709_634,
             previousblockhash: Some(block2.hash.clone()),
-            tx: vec![RpcTransaction {
-                txid: "33".repeat(32),
-                vin: vec![TxIn {
-                    txid: None,
-                    vout: None,
-                    coinbase: Some("00".to_owned()),
-                    txinwitness: vec![],
-                }],
-                vout: vec![TxOut {
-                    value: BtcAmount(25_000),
-                    n: 1,
-                    script_pub_key: ScriptPubKey {
-                        hex: format!("5120{output_key}"),
-                    },
-                }],
-            }],
+            tx: vec![
+                RpcTransaction {
+                    txid: "66".repeat(32),
+                    vin: vec![TxIn {
+                        txid: Some(sticky_prev_txid),
+                        vout: Some(0),
+                        coinbase: None,
+                        txinwitness: vec![
+                            "51".to_owned(),
+                            String::new(),
+                            script.to_owned(),
+                            "c0fa9b5ec193f735c41b804fc6ace1d28e81a299fc815c0f5009dd2dd7d0293c3b"
+                                .to_owned(),
+                        ],
+                    }],
+                    vout: vec![],
+                },
+                RpcTransaction {
+                    txid: "33".repeat(32),
+                    vin: vec![TxIn {
+                        txid: None,
+                        vout: None,
+                        coinbase: Some("00".to_owned()),
+                        txinwitness: vec![],
+                    }],
+                    vout: vec![TxOut {
+                        value: BtcAmount(25_000),
+                        n: 1,
+                        script_pub_key: ScriptPubKey {
+                            hex: format!("5120{output_key}"),
+                        },
+                    }],
+                },
+            ],
         };
-        db.commit_block(&block3, 709_632, 4, 144, &mut index, None)
+        let sticky_counts = db
+            .commit_block(&block3, 709_632, 1, 144, &mut index, None)
             .unwrap();
+        assert_eq!(sticky_counts.candidate_weak_scripts, 1);
+        assert_eq!(sticky_counts.no_proof_found_scripts, 0);
+        let sticky_config: String = db
+            .conn
+            .query_row("SELECT search_config_json FROM analysis_runs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(sticky_config.contains("\"requested_max_witness_items\":4"));
         let report = db.report().unwrap();
         assert_eq!(report.risks.len(), 1);
         assert_eq!(report.risks[0].current_balance_sats, 25_000);

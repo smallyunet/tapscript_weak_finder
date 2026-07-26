@@ -87,9 +87,18 @@ or returned a generic rejection. Because `testmempoolaccept` combines consensus
 and policy, a generic rejection leaves both layers inconclusive unless
 additional evidence separates them.
 
+A persisted candidate is not downgraded merely because a later run uses a
+smaller search bound and fails to rediscover its proof. A later authoritative
+validation may still promote it to `confirmed_weak`.
+
 ### `no_proof_found`
 
 No candidate was found in the bounded witness search.
+
+The scanner persists the TapLeaf hash, original script size, chain provenance,
+analyzer version, and search configuration for this result, but compacts the
+full script and observed witness. Re-analysis with a future analyzer therefore
+requires fetching the revealing block again.
 
 It must never be interpreted as:
 

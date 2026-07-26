@@ -54,9 +54,10 @@ motivation and the limits imposed by Taproot privacy.
 - Analyzes revealed leaf-version `0xc0` TapScripts with a bounded witness search.
 - Optionally validates candidate witnesses with Bitcoin Core in an isolated
   synthetic regtest.
-- Stores confirmed commitments, observed revelations, all analysis outcomes,
-  validation evidence, compact per-block checkpoints, currently unspent P2TR
-  outputs, and only a bounded recent window of spent P2TR rollback state.
+- Stores full evidence for weak and abnormal results, compact summaries for
+  `no_proof_found`, validation evidence, compact per-block checkpoints,
+  currently unspent P2TR outputs, and only a bounded recent window of spent
+  P2TR rollback state.
 - Resumes after interruption and attempts to reconcile chain reorganizations.
 - Exports current risks as JSON, limited to unspent outputs sharing an output
   key with a revealed candidate weak leaf.
@@ -222,6 +223,9 @@ BITCOIN_RPC_TIMEOUT_SECS
 BITCOIN_RPC_MAX_RETRIES
 BITCOIN_RPC_RETRY_INITIAL_MS
 BITCOIN_RPC_RETRY_MAX_MS
+BITCOIN_RPC_MAX_RESPONSE_MIB
+TAPSCRIPT_MIN_FREE_DISK_MIB
+TAPSCRIPT_MAX_IN_MEMORY_P2TR_UTXOS
 ```
 
 Read RPCs retry transient transport failures, HTTP 408/425/429/5xx responses,
@@ -229,12 +233,28 @@ Bitcoin Core warmup errors, and malformed success responses. Defaults are five
 retries with exponential delays from one to thirty seconds. Authentication and
 other permanent HTTP/RPC failures are not retried.
 
+RPC JSON is deserialized directly from a size-limited response stream. The
+default `--rpc-max-response-mib 64` stops on a larger response instead of
+buffering an unbounded block body. The default
+`--min-free-disk-mib 1024` checks the database filesystem before fetching and
+again before committing each block.
+
+The unspent P2TR HashMap is separately guarded by
+`--max-in-memory-p2tr-utxos`, defaulting to 1,000,000 entries. Zero disables
+this entry-count guard.
+
 The database never stores complete block or transaction responses. By default,
 `--reorg-retention-blocks 144` keeps spent P2TR rows only while they are needed
 to reverse the most recent 144 blocks. Older spent rows are deleted, while
 unspent P2TR state, compact block counts, checkpoints, and detection evidence
 remain. A deeper reorganization stops before changing local state and requires
 a database rebuild from a trusted checkpoint.
+
+For `no_proof_found`, the database keeps the TapLeaf hash, output key, original
+script size, revelation location, analyzer version, search configuration, and
+status, but clears the full script, Merkle-path JSON, annex, and observed
+witness. Candidate/confirmed weaknesses plus `inconclusive` and
+`invalid_script` outcomes retain complete evidence.
 
 ### Inspect scan status
 
