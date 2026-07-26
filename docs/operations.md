@@ -66,7 +66,7 @@ cargo run --release -- \
   --rpc-cookie /path/to/bitcoin/.cookie \
   --start-height 709632 \
   --end-height 710000 \
-  --progress json
+  --output json
 ```
 
 This database cannot recognize spends of P2TR outputs created before its start
@@ -97,7 +97,7 @@ Important status fields:
 | `last_block_hash` | Hash anchoring the checkpoint. |
 | `coverage_complete_from_genesis` | Whether the database started at height zero. |
 | `revealed_script_paths` | Verified script-path revelations observed. |
-| `weak_scripts` | Candidate weak leaves currently stored. |
+| `weak_scripts` | Leaves for which the bounded analyzer produced a weak witness, including candidate and Core-confirmed results. |
 | `analyzed_scripts` | Revealed `0xc0` leaves with persisted analysis coverage. |
 | `confirmed_weak_scripts` | Candidates accepted by the isolated Core validator. |
 | `candidate_weak_scripts` | Candidates without conclusive Core acceptance. |
@@ -106,32 +106,65 @@ Important status fields:
 Ctrl-C is handled between blocks. The current block completes before its
 transaction is committed or discarded.
 
-## Progress output
+## Per-block output
 
 ### Text
 
 ```bash
---progress text
+--output text
 ```
 
-Displays a progress bar, current height, aggregate transaction/input/output
-counts, revealed leaves, candidate weaknesses, scan rate, and ETA.
+Prints one line after every block transaction is committed to SQLite. Counts on
+that line belong only to that block. A progress bar remains visible on an
+interactive terminal.
 
 ### JSON
 
 ```bash
---progress json --progress-interval-secs 10
+--output json
 ```
 
-Emits newline-delimited JSON suitable for log collection.
+Emits newline-delimited JSON suitable for log collection. Event types are:
+
+| Type | Meaning |
+| --- | --- |
+| `scan_started` | Chain, invocation start height, target height, and resume flag. |
+| `block_result` | The just-committed block hash, per-block chain counts, analysis outcomes, and timing. |
+| `scan_summary` | Current-invocation totals and whether scanning was interrupted. |
+
+Important `block_result` fields include:
+
+- `transactions`, `inputs`, and `outputs`;
+- `p2tr_created` and `p2tr_spent`;
+- `revealed_script_paths` and `analyzed_scripts`;
+- `candidate_weak_scripts` and `confirmed_weak_scripts`;
+- `no_proof_found_scripts`, `inconclusive_scripts`, and
+  `invalid_script_scripts`;
+- `block_elapsed_ms` and `scan_elapsed_ms`.
+
+One JSON object is printed per line. Redirect stdout to retain the stream:
+
+```bash
+cargo run --release -- \
+  --db audit.sqlite \
+  scan \
+  --rpc-url http://127.0.0.1:8332 \
+  --rpc-cookie /path/to/bitcoin/.cookie \
+  --output json > block-results.ndjson
+```
+
+Cargo build messages and fatal errors use stderr, so the redirected file
+contains only scanner JSON after the process starts.
 
 ### None
 
 ```bash
---progress none
+--output none
 ```
 
 Suppresses progress reporting.
+
+The former `--progress text|json|none` option remains an alias.
 
 ## Reports
 

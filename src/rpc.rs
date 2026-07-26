@@ -182,20 +182,71 @@ fn btc_to_sats(text: &str) -> Result<u64> {
     if text.starts_with('-') {
         bail!("negative BTC amount");
     }
-    let (whole, fractional) = text.split_once('.').unwrap_or((text, ""));
-    if fractional.len() > 8 {
-        bail!("BTC amount has more than 8 decimal places: {text}");
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => {
+            if exponent.contains(['e', 'E']) {
+                bail!("BTC amount has multiple exponents: {text}");
+            }
+            let exponent = exponent
+                .parse::<i64>()
+                .with_context(|| format!("invalid BTC amount exponent: {text}"))?;
+            (mantissa, exponent)
+        }
+        None => (text, 0),
+    };
+    let (whole, fractional) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.contains('.') || fractional.contains('.') {
+        bail!("BTC amount has multiple decimal points: {text}");
     }
-    let whole: u64 = if whole.is_empty() { 0 } else { whole.parse()? };
-    let mut frac = fractional.to_owned();
-    while frac.len() < 8 {
-        frac.push('0');
+    if whole.is_empty() && fractional.is_empty() {
+        bail!("BTC amount has no digits");
     }
-    let frac: u64 = if frac.is_empty() { 0 } else { frac.parse()? };
-    whole
-        .checked_mul(100_000_000)
-        .and_then(|n| n.checked_add(frac))
-        .context("BTC amount overflow")
+    if !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fractional.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!("BTC amount contains a non-decimal digit: {text}");
+    }
+
+    let mut digits = String::with_capacity(whole.len() + fractional.len());
+    digits.push_str(whole);
+    digits.push_str(fractional);
+    if digits.bytes().all(|byte| byte == b'0') {
+        return Ok(0);
+    }
+    let first_nonzero = digits
+        .bytes()
+        .position(|byte| byte != b'0')
+        .expect("non-zero digit checked");
+    digits.drain(..first_nonzero);
+
+    let fractional_len =
+        i64::try_from(fractional.len()).context("BTC amount fractional length overflow")?;
+    let zero_shift = 8i64
+        .checked_add(exponent)
+        .and_then(|value| value.checked_sub(fractional_len))
+        .context("BTC amount exponent overflow")?;
+    if zero_shift >= 0 {
+        let zero_count = usize::try_from(zero_shift).context("BTC amount exponent overflow")?;
+        if digits.len().saturating_add(zero_count) > 20 {
+            bail!("BTC amount overflow: {text}");
+        }
+        digits.extend(std::iter::repeat_n('0', zero_count));
+    } else {
+        let remove_count =
+            usize::try_from(zero_shift.unsigned_abs()).context("BTC amount exponent overflow")?;
+        if remove_count > digits.len() {
+            bail!("BTC amount is smaller than one satoshi: {text}");
+        }
+        let keep = digits.len() - remove_count;
+        if digits.as_bytes()[keep..].iter().any(|byte| *byte != b'0') {
+            bail!("BTC amount is smaller than one satoshi: {text}");
+        }
+        digits.truncate(keep);
+    }
+
+    digits
+        .parse::<u64>()
+        .with_context(|| format!("BTC amount overflow: {text}"))
 }
 
 #[cfg(test)]
@@ -207,10 +258,26 @@ mod tests {
         assert_eq!(btc_to_sats("1").unwrap(), 100_000_000);
         assert_eq!(btc_to_sats("0.00000001").unwrap(), 1);
         assert_eq!(btc_to_sats("12.34000000").unwrap(), 1_234_000_000);
+        assert_eq!(btc_to_sats("0.00000600").unwrap(), 600);
+        assert_eq!(btc_to_sats("6e-6").unwrap(), 600);
+        assert_eq!(btc_to_sats("1E-8").unwrap(), 1);
+        assert_eq!(btc_to_sats("000000000000.00000600").unwrap(), 600);
+        assert_eq!(btc_to_sats("184467440737.09551615").unwrap(), u64::MAX);
     }
 
     #[test]
     fn rejects_sub_satoshi_amounts() {
         assert!(btc_to_sats("0.000000001").is_err());
+        assert!(btc_to_sats("1e-9").is_err());
+        assert!(btc_to_sats("-0.00000001").is_err());
+        assert!(btc_to_sats("184467440737.09551616").is_err());
+    }
+
+    #[test]
+    fn deserializes_provider_amount_without_floating_point_round_trip() {
+        let fixed: BtcAmount = serde_json::from_str("0.00000600").unwrap();
+        let scientific: BtcAmount = serde_json::from_str("6e-6").unwrap();
+        assert_eq!(fixed.0, 600);
+        assert_eq!(scientific.0, 600);
     }
 }

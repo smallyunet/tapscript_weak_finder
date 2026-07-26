@@ -74,11 +74,9 @@ struct ScanArgs {
     #[arg(long)]
     taproot_activation_height: Option<u64>,
 
-    #[arg(long, value_enum, default_value_t = ProgressArg::Text)]
-    progress: ProgressArg,
-
-    #[arg(long, default_value_t = 5)]
-    progress_interval_secs: u64,
+    /// Print one result for every committed block. `--progress` is retained as an alias.
+    #[arg(long, visible_alias = "progress", value_enum, default_value_t = OutputArg::Text)]
+    output: OutputArg,
 
     #[arg(long, default_value_t = 4)]
     max_witness_items: usize,
@@ -110,18 +108,18 @@ struct AnalyzeScriptArgs {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum ProgressArg {
+enum OutputArg {
     Text,
     Json,
     None,
 }
 
-impl From<ProgressArg> for ProgressMode {
-    fn from(value: ProgressArg) -> Self {
+impl From<OutputArg> for ProgressMode {
+    fn from(value: OutputArg) -> Self {
         match value {
-            ProgressArg::Text => Self::Text,
-            ProgressArg::Json => Self::Json,
-            ProgressArg::None => Self::None,
+            OutputArg::Text => Self::Text,
+            OutputArg::Json => Self::Json,
+            OutputArg::None => Self::None,
         }
     }
 }
@@ -151,8 +149,7 @@ fn main() -> Result<()> {
                 requested_start_height: args.start_height,
                 requested_end_height: args.end_height,
                 taproot_activation_height: args.taproot_activation_height,
-                progress_mode: args.progress.into(),
-                progress_interval_secs: args.progress_interval_secs,
+                progress_mode: args.output.into(),
                 max_witness_items: args.max_witness_items,
             };
             let scanner = Scanner::new(rpc, &mut db, config);

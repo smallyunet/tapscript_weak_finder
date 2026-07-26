@@ -50,7 +50,13 @@ pub struct BlockCounts {
     pub p2tr_created: u64,
     pub p2tr_spent: u64,
     pub script_paths: u64,
+    pub analyzed_scripts: u64,
     pub weak_scripts: u64,
+    pub confirmed_weak_scripts: u64,
+    pub candidate_weak_scripts: u64,
+    pub no_proof_found_scripts: u64,
+    pub inconclusive_scripts: u64,
+    pub invalid_script_scripts: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -408,6 +414,7 @@ impl Database {
                                     details: None,
                                 }
                             };
+                            counts.analyzed_scripts += 1;
                             let search_config = serde_json::json!({
                                 "requested_max_witness_items": max_witness_items,
                                 "effective_max_witness_items": max_witness_items.min(12),
@@ -464,6 +471,19 @@ impl Database {
                                     unix_timestamp(),
                                 ],
                             )?;
+                            let effective_detection_status: String = tx.query_row(
+                                "SELECT detection_status FROM analysis_runs WHERE tapleaf_id=?1",
+                                [tapleaf_id],
+                                |row| row.get(0),
+                            )?;
+                            match effective_detection_status.as_str() {
+                                "confirmed_weak" => counts.confirmed_weak_scripts += 1,
+                                "candidate_weak" => counts.candidate_weak_scripts += 1,
+                                "no_proof_found" => counts.no_proof_found_scripts += 1,
+                                "inconclusive" => counts.inconclusive_scripts += 1,
+                                "invalid_script" => counts.invalid_script_scripts += 1,
+                                value => bail!("stored unknown detection status {value}"),
+                            }
                             if matches!(analysis.status, AnalysisStatus::Weak) {
                                 counts.weak_scripts += 1;
                                 tx.execute(
@@ -993,8 +1013,12 @@ mod tests {
                 vout: vec![],
             }],
         };
-        db.commit_block(&block2, 709_632, 4, &mut index, None)
+        let block2_counts = db
+            .commit_block(&block2, 709_632, 4, &mut index, None)
             .unwrap();
+        assert_eq!(block2_counts.analyzed_scripts, 1);
+        assert_eq!(block2_counts.candidate_weak_scripts, 1);
+        assert_eq!(block2_counts.confirmed_weak_scripts, 0);
         assert!(db.report().unwrap().risks.is_empty());
 
         let block3 = Block {
@@ -1065,8 +1089,11 @@ mod tests {
                 }],
             }],
         };
-        db.commit_block(&block4, 709_632, 4, &mut index, None)
+        let block4_counts = db
+            .commit_block(&block4, 709_632, 4, &mut index, None)
             .unwrap();
+        assert_eq!(block4_counts.candidate_weak_scripts, 0);
+        assert_eq!(block4_counts.confirmed_weak_scripts, 1);
         let report = db.report().unwrap();
         assert_eq!(report.risks[0].detection_status, "confirmed_weak");
         assert_eq!(report.risks[0].validator, "test-validator");

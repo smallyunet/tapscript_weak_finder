@@ -37,7 +37,8 @@ flowchart TD
     K --> E
     CAND --> E
     CONF --> E
-    E --> L["Status and JSON risk report"]
+    E --> O["Emit committed block_result"]
+    O --> L["Status, scan_summary, and JSON risk report"]
 ```
 
 ## Module responsibilities
@@ -52,7 +53,7 @@ flowchart TD
 | `src/core_validator.rs` | Temporary isolated regtest lifecycle, synthetic fixture construction, candidate serialization, and Bitcoin Core validation. |
 | `src/detection.rs` | Detection, consensus, and policy evidence states plus the validator boundary. |
 | `src/db.rs` | SQLite schema, block-atomic persistence, local P2TR UTXO state, rollback, status, and risk reporting. |
-| `src/progress.rs` | Human-readable progress bars and newline-delimited JSON progress snapshots. |
+| `src/progress.rs` | Per-committed-block text/NDJSON events, run totals, and interactive progress bars. |
 
 ## Scan lifecycle
 
@@ -123,6 +124,8 @@ All database changes for a block are committed in one SQLite transaction:
 - last block hash.
 
 An interruption between blocks leaves the last committed checkpoint resumable.
+The corresponding `block_result` is emitted only after that block transaction
+commits, so every printed height is a durable resume boundary.
 
 ### 5. Reorganization reconciliation
 

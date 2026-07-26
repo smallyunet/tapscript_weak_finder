@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,7 +21,6 @@ pub struct ScanConfig {
     pub requested_end_height: Option<u64>,
     pub taproot_activation_height: Option<u64>,
     pub progress_mode: ProgressMode,
-    pub progress_interval_secs: u64,
     pub max_witness_items: usize,
 }
 
@@ -73,7 +75,6 @@ impl<'a> Scanner<'a> {
         let status = self.db.status()?;
         let mut progress = ProgressReporter::new(
             self.config.progress_mode,
-            self.config.progress_interval_secs,
             state.start_height,
             state.next_height,
             target,
@@ -88,6 +89,7 @@ impl<'a> Scanner<'a> {
 
         let mut height = state.next_height;
         while height <= target {
+            let block_started = Instant::now();
             if interrupted.load(Ordering::SeqCst) {
                 progress.finish(true);
                 return Ok(());
@@ -115,9 +117,9 @@ impl<'a> Scanner<'a> {
                 &mut unspent_index,
                 self.validator.as_deref_mut(),
             )?;
+            progress.block_committed(height, &hash, counts, block_started.elapsed().as_millis());
             state.last_block_hash = Some(hash);
             state.next_height = height + 1;
-            progress.block_committed(height, counts);
             height += 1;
         }
         progress.finish(false);

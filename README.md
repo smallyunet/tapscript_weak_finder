@@ -155,6 +155,19 @@ The analysis contains:
 
 ### Scan with Bitcoin Core cookie authentication
 
+For an RPC endpoint that does not require client-side authentication:
+
+```bash
+cargo run --release -- \
+  --db tapscript-audit.sqlite \
+  scan \
+  --rpc-url https://node.example.com \
+  --output json
+```
+
+Most private nodes also require `--rpc-cookie` or
+`--rpc-user`/`--rpc-password`:
+
 ```bash
 cargo run --release -- \
   --db tapscript-audit.sqlite \
@@ -162,7 +175,7 @@ cargo run --release -- \
   --rpc-cookie /path/to/bitcoin/.cookie \
   --verify-with-bitcoin-core \
   --bitcoind /path/to/bitcoind \
-  --progress text
+  --output text
 ```
 
 For an initial bounded run:
@@ -173,8 +186,22 @@ cargo run --release -- \
   scan \
   --rpc-cookie /path/to/bitcoin/.cookie \
   --end-height 710000 \
-  --progress json
+  --output json
 ```
+
+`--output text` prints one human-readable line after every block is durably
+committed. `--output json` emits newline-delimited events suitable for piping
+to a file or log collector:
+
+```json
+{"type":"scan_started","chain":"main","start_height":709632,"target_height":710000,"resumed":false}
+{"type":"block_result","height":709632,"block_hash":"...","transactions":2341,"p2tr_created":12,"revealed_script_paths":0,"analyzed_scripts":0,"candidate_weak_scripts":0,"confirmed_weak_scripts":0}
+{"type":"scan_summary","interrupted":false,"start_height":709632,"last_committed_height":710000,"target_height":710000,"completed_blocks":369}
+```
+
+Every `block_result` contains counts for that block only. `scan_summary`
+contains totals for the current invocation. The legacy `--progress` spelling is
+retained as an alias for `--output`.
 
 The same command can be run again to resume. The database is tied to the
 original chain, start height, and Taproot activation height.
