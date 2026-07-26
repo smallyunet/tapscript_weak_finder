@@ -1,5 +1,8 @@
 # Operations
 
+The concrete deployment record and runbook for SSH host `a` is maintained in
+[`deployment-host-a.md`](deployment-host-a.md).
+
 ## Safety model
 
 The configured chain node is always read-only:
