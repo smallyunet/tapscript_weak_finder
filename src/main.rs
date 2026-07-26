@@ -1,0 +1,217 @@
+// Clippy 1.88 reports a false-positive formatting-literal warning at the
+// `detection` module declaration while checking the serde-derived test target.
+#![allow(clippy::literal_string_with_formatting_args)]
+
+mod analyzer;
+mod core_validator;
+mod db;
+mod detection;
+mod progress;
+mod rpc;
+mod scanner;
+mod taproot;
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+use crate::{
+    analyzer::{AnalysisStatus, analyze_script},
+    core_validator::CoreRegtestValidator,
+    db::Database,
+    detection::{CandidateValidator, ValidationEvidence},
+    progress::ProgressMode,
+    rpc::{Auth, RpcClient},
+    scanner::{ScanConfig, Scanner},
+};
+
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Cli {
+    #[arg(long, default_value = "tapscript-audit.sqlite", global = true)]
+    db: PathBuf,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Scan blocks in canonical order. Existing progress is resumed automatically.
+    Scan(ScanArgs),
+    /// Show the durable scanner checkpoint and accumulated counts.
+    Status,
+    /// Export current confirmed matches as JSON.
+    Report(ReportArgs),
+    /// Analyze one raw TapScript locally, with optional isolated Core validation.
+    AnalyzeScript(AnalyzeScriptArgs),
+}
+
+#[derive(Args, Debug)]
+struct ScanArgs {
+    #[arg(long, env = "BITCOIN_RPC_URL", default_value = "http://127.0.0.1:8332")]
+    rpc_url: String,
+
+    #[arg(long, env = "BITCOIN_RPC_COOKIE")]
+    rpc_cookie: Option<PathBuf>,
+
+    #[arg(long, env = "BITCOIN_RPC_USER", requires = "rpc_password")]
+    rpc_user: Option<String>,
+
+    #[arg(long, env = "BITCOIN_RPC_PASSWORD", requires = "rpc_user")]
+    rpc_password: Option<String>,
+
+    /// Defaults to zero so the local P2TR UTXO view is complete.
+    #[arg(long, default_value_t = 0)]
+    start_height: u64,
+
+    /// Pin the initial run to a height. By default the current node tip is used.
+    #[arg(long)]
+    end_height: Option<u64>,
+
+    /// Override the network's known Taproot activation height.
+    #[arg(long)]
+    taproot_activation_height: Option<u64>,
+
+    #[arg(long, value_enum, default_value_t = ProgressArg::Text)]
+    progress: ProgressArg,
+
+    #[arg(long, default_value_t = 5)]
+    progress_interval_secs: u64,
+
+    #[arg(long, default_value_t = 4)]
+    max_witness_items: usize,
+
+    /// Validate candidates using a fresh, isolated Bitcoin Core regtest node.
+    #[arg(long, default_value_t = false)]
+    verify_with_bitcoin_core: bool,
+
+    /// Bitcoin Core executable used only for isolated regtest validation.
+    #[arg(long, default_value = "bitcoind")]
+    bitcoind: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct AnalyzeScriptArgs {
+    #[arg(long)]
+    script_hex: String,
+
+    #[arg(long, default_value_t = 4)]
+    max_witness_items: usize,
+
+    /// Validate a candidate using a fresh, isolated Bitcoin Core regtest node.
+    #[arg(long, default_value_t = false)]
+    verify_with_bitcoin_core: bool,
+
+    /// Bitcoin Core executable used only for isolated regtest validation.
+    #[arg(long, default_value = "bitcoind")]
+    bitcoind: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ProgressArg {
+    Text,
+    Json,
+    None,
+}
+
+impl From<ProgressArg> for ProgressMode {
+    fn from(value: ProgressArg) -> Self {
+        match value {
+            ProgressArg::Text => Self::Text,
+            ProgressArg::Json => Self::Json,
+            ProgressArg::None => Self::None,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+struct ReportArgs {
+    #[arg(long)]
+    output: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    pretty: bool,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let mut db = Database::open(&cli.db)?;
+
+    match cli.command {
+        Command::Scan(args) => {
+            let auth = match (args.rpc_cookie, args.rpc_user, args.rpc_password) {
+                (Some(path), None, None) => Auth::CookieFile(path),
+                (None, Some(user), Some(password)) => Auth::UserPassword { user, password },
+                (None, None, None) => Auth::None,
+                _ => anyhow::bail!("use either --rpc-cookie or --rpc-user/--rpc-password"),
+            };
+            let rpc = RpcClient::new(args.rpc_url, auth)?;
+            let config = ScanConfig {
+                requested_start_height: args.start_height,
+                requested_end_height: args.end_height,
+                taproot_activation_height: args.taproot_activation_height,
+                progress_mode: args.progress.into(),
+                progress_interval_secs: args.progress_interval_secs,
+                max_witness_items: args.max_witness_items,
+            };
+            let scanner = Scanner::new(rpc, &mut db, config);
+            if args.verify_with_bitcoin_core {
+                scanner
+                    .with_validator(Box::new(CoreRegtestValidator::start(&args.bitcoind)?))
+                    .run()
+            } else {
+                scanner.run()
+            }
+        }
+        Command::Status => {
+            println!("{}", serde_json::to_string_pretty(&db.status()?)?);
+            Ok(())
+        }
+        Command::Report(args) => {
+            let report = db.report()?;
+            let bytes = if args.pretty {
+                serde_json::to_vec_pretty(&report)?
+            } else {
+                serde_json::to_vec(&report)?
+            };
+            if let Some(path) = args.output {
+                std::fs::write(path, bytes)?;
+            } else {
+                println!("{}", String::from_utf8(bytes)?);
+            }
+            Ok(())
+        }
+        Command::AnalyzeScript(args) => {
+            let script = hex::decode(args.script_hex)?;
+            let analysis = analyze_script(&script, args.max_witness_items);
+            let validation = if args.verify_with_bitcoin_core
+                && matches!(analysis.status, AnalysisStatus::Weak)
+            {
+                let proof = analysis
+                    .proof_witness
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(hex::decode)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut validator = CoreRegtestValidator::start(&args.bitcoind)?;
+                Some(validator.validate(&script, &proof).unwrap_or_else(|error| {
+                    ValidationEvidence::validation_failed(validator.name(), &error)
+                }))
+            } else if matches!(analysis.status, AnalysisStatus::Weak) {
+                Some(ValidationEvidence::candidate_without_authoritative_validation())
+            } else {
+                None
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "analysis": analysis,
+                    "validation": validation,
+                }))?
+            );
+            Ok(())
+        }
+    }
+}
