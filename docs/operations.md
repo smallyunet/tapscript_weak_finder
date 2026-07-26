@@ -22,6 +22,12 @@ reconciling a chain reorganization.
 Use a fully synchronized, non-pruned Bitcoin Core node. The scanner requests
 complete decoded blocks using `getblock` with verbosity 2.
 
+The RPC client retries transient transport errors, HTTP 408/425/429/5xx
+responses, Bitcoin Core warmup (`-28`), and malformed HTTP 200 response bodies.
+It does not retry authentication failures or ordinary JSON-RPC method errors.
+RPC diagnostics go to stderr and do not include the configured URL, so an API
+key embedded in that URL is not copied into scanner logs.
+
 Authentication options:
 
 1. RPC cookie file, recommended for a local node.
@@ -39,6 +45,16 @@ cargo run --release -- \
   scan \
   --rpc-url http://127.0.0.1:8332 \
   --rpc-cookie /path/to/bitcoin/.cookie
+```
+
+For a hosted provider, the defaults can be adjusted through CLI options or
+environment variables:
+
+```text
+--rpc-timeout-secs / BITCOIN_RPC_TIMEOUT_SECS
+--rpc-max-retries / BITCOIN_RPC_MAX_RETRIES
+--rpc-retry-initial-ms / BITCOIN_RPC_RETRY_INITIAL_MS
+--rpc-retry-max-ms / BITCOIN_RPC_RETRY_MAX_MS
 ```
 
 ## Scan ranges and coverage
@@ -75,6 +91,10 @@ height. Its status reports `coverage_complete_from_genesis: false`.
 Use a separate database for a different start height or activation-height
 configuration.
 
+When `--end-height` is omitted, the target is the node tip observed by the
+initial `getblockchaininfo` call. The process scans to that fixed height and
+exits; it does not follow blocks mined later.
+
 ## Resuming
 
 The scanner commits after every block. Re-run the same command to continue from
@@ -102,6 +122,8 @@ Important status fields:
 | `confirmed_weak_scripts` | Candidates accepted by the isolated Core validator. |
 | `candidate_weak_scripts` | Candidates without conclusive Core acceptance. |
 | `current_p2tr_utxos` | Unspent P2TR outputs known to this database. |
+| `reorg_retention_blocks` | Configured number of recent blocks whose spent P2TR state is retained. |
+| `oldest_reorg_safe_height` | Oldest block that can currently be rolled back without rebuilding. |
 
 Ctrl-C is handled between blocks. The current block completes before its
 transaction is committed or discarded.
@@ -203,10 +225,24 @@ tapscript-audit.sqlite-shm
 Do not copy only the main database file during an active scan. Stop the scanner
 cleanly or use a SQLite-aware backup procedure.
 
-Keep periodic recoverable backups. Reconciliation now aborts on RPC errors and
-rolls back only after a successfully retrieved canonical hash differs from the
-checkpoint. Rollback activity still should not be treated as independent proof
-of a real chain reorganization.
+The database does not retain complete block or transaction JSON. It stores:
+
+- the current unspent P2TR index required to match later spends;
+- spent P2TR rows inside the recent reorganization window;
+- block hashes and aggregate counts;
+- verified revelation and analysis evidence;
+- the durable resume checkpoint.
+
+The default `--reorg-retention-blocks 144` deletes spent P2TR rows once they
+fall outside the rollback window. SQLite reuses those pages for later writes;
+deleting rows does not necessarily shrink the existing file immediately. A
+reorganization deeper than the retained window is rejected before any rollback
+and requires rebuilding the database from a trusted checkpoint.
+
+Keep periodic recoverable backups. Reconciliation aborts on RPC errors and
+plans the complete rollback before modifying local rows. Rollback activity
+still should not be treated as independent proof of a real chain
+reorganization.
 
 ## Performance expectations
 
@@ -225,7 +261,6 @@ machine.
 Potential future improvements include:
 
 - JSON-RPC batching or pipelining;
-- retry and exponential backoff for read RPCs;
 - a UTXO snapshot/bootstrap mode with explicit provenance;
 - reduced-memory indexing;
 - periodic database checkpoints and verified backups;

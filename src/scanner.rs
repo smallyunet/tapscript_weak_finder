@@ -22,6 +22,7 @@ pub struct ScanConfig {
     pub taproot_activation_height: Option<u64>,
     pub progress_mode: ProgressMode,
     pub max_witness_items: usize,
+    pub reorg_retention_blocks: u64,
 }
 
 pub struct Scanner<'a> {
@@ -67,6 +68,7 @@ impl<'a> Scanner<'a> {
             self.config.requested_start_height,
             target,
             activation_height,
+            self.config.reorg_retention_blocks,
         )?;
 
         self.reconcile_reorg(&mut state)?;
@@ -114,6 +116,7 @@ impl<'a> Scanner<'a> {
                 &block,
                 activation_height,
                 self.config.max_witness_items,
+                self.config.reorg_retention_blocks,
                 &mut unspent_index,
                 self.validator.as_deref_mut(),
             )?;
@@ -127,16 +130,38 @@ impl<'a> Scanner<'a> {
     }
 
     fn reconcile_reorg(&mut self, state: &mut crate::db::ScanState) -> Result<()> {
-        while state.next_height > state.start_height {
-            let last_height = state.next_height - 1;
-            let canonical = self.rpc.block_hash(last_height).with_context(|| {
-                format!(
-                    "fetch canonical block hash at height {last_height} during reorg reconciliation"
-                )
+        if state.next_height == state.start_height {
+            return Ok(());
+        }
+
+        let mut cursor = state.next_height - 1;
+        let common_ancestor = loop {
+            let canonical = self.rpc.block_hash(cursor).with_context(|| {
+                format!("fetch canonical block hash at height {cursor} during reorg reconciliation")
             })?;
-            if state.last_block_hash.as_deref() == Some(canonical.as_str()) {
-                break;
+            let local = self
+                .db
+                .scanned_block_hash(cursor)?
+                .with_context(|| format!("missing local block checkpoint at height {cursor}"))?;
+            if local == canonical {
+                break Some(cursor);
             }
+            if cursor == state.start_height {
+                break None;
+            }
+            cursor -= 1;
+        };
+
+        let first_rollback_height = common_ancestor
+            .map(|height| height + 1)
+            .unwrap_or(state.start_height);
+        if first_rollback_height == state.next_height {
+            return Ok(());
+        }
+        self.db
+            .ensure_reorg_can_rollback_from(first_rollback_height)?;
+
+        while state.next_height > first_rollback_height {
             self.db
                 .rollback_tip()?
                 .context("checkpoint references a block missing from scanned_blocks")?;

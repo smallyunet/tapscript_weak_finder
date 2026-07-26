@@ -7,7 +7,7 @@ currently unspent P2TR outputs that reuse the same Taproot output key.
 
 > [!WARNING]
 > This project is research software, not a production security oracle. A
-> A local `weak` result is only a candidate produced by the bounded analyzer.
+> local `weak` result is only a candidate produced by the bounded analyzer.
 > Only a synthetic equivalent accepted by Bitcoin Core on isolated regtest is
 > promoted to `confirmed_weak`. A result other than `weak` does not prove that a
 > script is safe.
@@ -55,7 +55,8 @@ motivation and the limits imposed by Taproot privacy.
 - Optionally validates candidate witnesses with Bitcoin Core in an isolated
   synthetic regtest.
 - Stores confirmed commitments, observed revelations, all analysis outcomes,
-  validation evidence, and per-block checkpoints.
+  validation evidence, compact per-block checkpoints, currently unspent P2TR
+  outputs, and only a bounded recent window of spent P2TR rollback state.
 - Resumes after interruption and attempts to reconcile chain reorganizations.
 - Exports current risks as JSON, limited to unspent outputs sharing an output
   key with a revealed candidate weak leaf.
@@ -206,6 +207,10 @@ retained as an alias for `--output`.
 The same command can be run again to resume. The database is tied to the
 original chain, start height, and Taproot activation height.
 
+Without `--end-height`, the scanner captures the node tip once at startup,
+scans through that fixed target, and exits. Blocks mined after startup are not
+added to the current run.
+
 RPC credentials can also be supplied through:
 
 ```text
@@ -213,7 +218,23 @@ BITCOIN_RPC_URL
 BITCOIN_RPC_COOKIE
 BITCOIN_RPC_USER
 BITCOIN_RPC_PASSWORD
+BITCOIN_RPC_TIMEOUT_SECS
+BITCOIN_RPC_MAX_RETRIES
+BITCOIN_RPC_RETRY_INITIAL_MS
+BITCOIN_RPC_RETRY_MAX_MS
 ```
+
+Read RPCs retry transient transport failures, HTTP 408/425/429/5xx responses,
+Bitcoin Core warmup errors, and malformed success responses. Defaults are five
+retries with exponential delays from one to thirty seconds. Authentication and
+other permanent HTTP/RPC failures are not retried.
+
+The database never stores complete block or transaction responses. By default,
+`--reorg-retention-blocks 144` keeps spent P2TR rows only while they are needed
+to reverse the most recent 144 blocks. Older spent rows are deleted, while
+unspent P2TR state, compact block counts, checkpoints, and detection evidence
+remain. A deeper reorganization stops before changing local state and requires
+a database rebuild from a trusted checkpoint.
 
 ### Inspect scan status
 
@@ -260,9 +281,9 @@ The repository is a functional research prototype:
   exist.
 - Reorganization reconciliation propagates RPC failures instead of treating
   them as canonical-hash mismatches.
-- Broader differential tests, RPC fault injection, transaction-context
-  semantics, search-space expansion, and mainnet-scale benchmarks are still
-  needed.
+- Transient HTTP and malformed-response retry paths have fault-injection tests.
+- Broader differential and reorganization tests, transaction-context semantics,
+  search-space expansion, and mainnet-scale benchmarks are still needed.
 
 Do not use the current scanner unattended against an irreplaceable database.
 Keep backups and validate findings independently.

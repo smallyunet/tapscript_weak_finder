@@ -67,6 +67,8 @@ pub struct Status {
     pub target_height: Option<u64>,
     pub last_block_hash: Option<String>,
     pub taproot_activation_height: Option<u64>,
+    pub reorg_retention_blocks: Option<u64>,
+    pub oldest_reorg_safe_height: Option<u64>,
     pub coverage_complete_from_genesis: bool,
     pub scanned_blocks: u64,
     pub scanned_transactions: u64,
@@ -163,6 +165,8 @@ impl Database {
                 ON p2tr_outputs(output_key) WHERE spent_height IS NULL;
             CREATE INDEX IF NOT EXISTS p2tr_outputs_spent_block
                 ON p2tr_outputs(spent_block_hash);
+            CREATE INDEX IF NOT EXISTS p2tr_outputs_spent_height
+                ON p2tr_outputs(spent_height) WHERE spent_height IS NOT NULL;
             CREATE INDEX IF NOT EXISTS p2tr_outputs_created_block
                 ON p2tr_outputs(created_block_hash);
 
@@ -227,7 +231,11 @@ impl Database {
         start_height: u64,
         target_height: u64,
         activation_height: u64,
+        reorg_retention_blocks: u64,
     ) -> Result<ScanState> {
+        if reorg_retention_blocks == 0 {
+            bail!("reorg retention must be at least one block");
+        }
         let existing = self.scan_state()?;
         if let Some(mut state) = existing {
             if state.chain != chain {
@@ -253,6 +261,18 @@ impl Database {
             }
             state.target_height = target_height;
             set_meta(&self.conn, "target_height", &target_height.to_string())?;
+            set_meta(
+                &self.conn,
+                "reorg_retention_blocks",
+                &reorg_retention_blocks.to_string(),
+            )?;
+            if get_meta(&self.conn, "oldest_reorg_safe_height")?.is_none() {
+                set_meta(
+                    &self.conn,
+                    "oldest_reorg_safe_height",
+                    &state.start_height.to_string(),
+                )?;
+            }
             return Ok(state);
         }
 
@@ -266,6 +286,12 @@ impl Database {
             "taproot_activation_height",
             &activation_height.to_string(),
         )?;
+        set_meta_tx(
+            &tx,
+            "reorg_retention_blocks",
+            &reorg_retention_blocks.to_string(),
+        )?;
+        set_meta_tx(&tx, "oldest_reorg_safe_height", &start_height.to_string())?;
         tx.commit()?;
         Ok(ScanState {
             chain: chain.to_owned(),
@@ -296,9 +322,13 @@ impl Database {
         block: &Block,
         activation_height: u64,
         max_witness_items: usize,
+        reorg_retention_blocks: u64,
         unspent_index: &mut HashMap<OutPoint, P2trPrevout>,
         mut validator: Option<&mut (dyn CandidateValidator + 'static)>,
     ) -> Result<BlockCounts> {
+        if reorg_retention_blocks == 0 {
+            bail!("reorg retention must be at least one block");
+        }
         let tx = self.conn.transaction()?;
         let mut counts = BlockCounts {
             transactions: block.tx.len() as u64,
@@ -580,6 +610,12 @@ impl Database {
         )?;
         set_meta_tx(&tx, "next_height", &(block.height + 1).to_string())?;
         set_meta_tx(&tx, "last_block_hash", &block.hash)?;
+        prune_spent_reorg_state(
+            &tx,
+            block.height,
+            reorg_retention_blocks,
+            parse_meta_tx(&tx, "start_height")?,
+        )?;
         tx.commit()?;
         Ok(counts)
     }
@@ -618,6 +654,7 @@ impl Database {
         else {
             return Ok(None);
         };
+        self.ensure_reorg_can_rollback_from(height)?;
         let tx = self.conn.transaction()?;
         tx.execute(
             r#"
@@ -657,6 +694,36 @@ impl Database {
         }
         tx.commit()?;
         Ok(Some(height))
+    }
+
+    pub fn scanned_block_hash(&self, height: u64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT block_hash FROM scanned_blocks WHERE height=?1",
+                [height],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn ensure_reorg_can_rollback_from(&self, first_height: u64) -> Result<()> {
+        let oldest = get_meta(&self.conn, "oldest_reorg_safe_height")?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .context("metadata key oldest_reorg_safe_height is invalid")
+            })
+            .transpose()?
+            .unwrap_or(first_height);
+        if first_height < oldest {
+            bail!(
+                "reorganization requires rolling back from height {first_height}, \
+                 but compact storage only retains rollback state from height {oldest}; \
+                 rebuild the database from a trusted checkpoint"
+            );
+        }
+        Ok(())
     }
 
     pub fn status(&self) -> Result<Status> {
@@ -724,6 +791,8 @@ impl Database {
             taproot_activation_height: self
                 .scan_state()?
                 .map(|value| value.taproot_activation_height),
+            reorg_retention_blocks: optional_meta_u64(&self.conn, "reorg_retention_blocks")?,
+            oldest_reorg_safe_height: optional_meta_u64(&self.conn, "oldest_reorg_safe_height")?,
             coverage_complete_from_genesis: self
                 .scan_state()?
                 .is_some_and(|value| value.start_height == 0),
@@ -875,6 +944,35 @@ impl OutPoint {
     }
 }
 
+fn prune_spent_reorg_state(
+    tx: &Transaction<'_>,
+    height: u64,
+    retention_blocks: u64,
+    start_height: u64,
+) -> Result<()> {
+    let Some(cutoff) = height.checked_sub(retention_blocks) else {
+        return Ok(());
+    };
+    tx.execute(
+        "DELETE FROM p2tr_outputs
+         WHERE spent_height IS NOT NULL AND spent_height <= ?1",
+        [cutoff],
+    )?;
+    let proposed_oldest = cutoff.saturating_add(1).max(start_height);
+    let current_oldest = get_meta_tx(tx, "oldest_reorg_safe_height")?
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .context("metadata key oldest_reorg_safe_height is invalid")
+        })
+        .transpose()?
+        .unwrap_or(start_height);
+    if proposed_oldest > current_oldest {
+        set_meta_tx(tx, "oldest_reorg_safe_height", &proposed_oldest.to_string())?;
+    }
+    Ok(())
+}
+
 fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO metadata(key,value) VALUES (?1,?2)
@@ -917,6 +1015,14 @@ fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+fn get_meta_tx(tx: &Transaction<'_>, key: &str) -> Result<Option<String>> {
+    Ok(tx
+        .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
 fn parse_meta<T>(conn: &Connection, key: &str) -> Result<T>
 where
     T: std::str::FromStr,
@@ -926,6 +1032,27 @@ where
         .with_context(|| format!("metadata key {key} is missing"))?
         .parse()
         .with_context(|| format!("metadata key {key} is invalid"))
+}
+
+fn parse_meta_tx<T>(tx: &Transaction<'_>, key: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    get_meta_tx(tx, key)?
+        .with_context(|| format!("metadata key {key} is missing"))?
+        .parse()
+        .with_context(|| format!("metadata key {key} is invalid"))
+}
+
+fn optional_meta_u64(conn: &Connection, key: &str) -> Result<Option<u64>> {
+    get_meta(conn, key)?
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .with_context(|| format!("metadata key {key} is invalid"))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -942,7 +1069,7 @@ mod tests {
     fn initializes_and_reopens_scan_state() {
         let file = NamedTempFile::new().unwrap();
         let mut db = Database::open(file.path()).unwrap();
-        let state = db.prepare_scan("regtest", 0, 100, 0).unwrap();
+        let state = db.prepare_scan("regtest", 0, 100, 0, 144).unwrap();
         assert_eq!(state.next_height, 0);
         drop(db);
 
@@ -953,10 +1080,78 @@ mod tests {
     }
 
     #[test]
+    fn prunes_old_spent_outputs_and_refuses_an_unsafe_deep_rollback() {
+        let file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(file.path()).unwrap();
+        db.prepare_scan("regtest", 0, 2, 0, 1).unwrap();
+        let mut index = HashMap::new();
+        let funding_txid = "10".repeat(32);
+        let output_key = "11".repeat(32);
+        let block0 = Block {
+            hash: "20".repeat(32),
+            height: 0,
+            previousblockhash: None,
+            tx: vec![RpcTransaction {
+                txid: funding_txid.clone(),
+                vin: vec![TxIn {
+                    txid: None,
+                    vout: None,
+                    coinbase: Some("00".to_owned()),
+                    txinwitness: vec![],
+                }],
+                vout: vec![TxOut {
+                    value: BtcAmount(1_000),
+                    n: 0,
+                    script_pub_key: ScriptPubKey {
+                        hex: format!("5120{output_key}"),
+                    },
+                }],
+            }],
+        };
+        db.commit_block(&block0, 0, 4, 1, &mut index, None).unwrap();
+        let block1 = Block {
+            hash: "21".repeat(32),
+            height: 1,
+            previousblockhash: Some(block0.hash.clone()),
+            tx: vec![RpcTransaction {
+                txid: "12".repeat(32),
+                vin: vec![TxIn {
+                    txid: Some(funding_txid),
+                    vout: Some(0),
+                    coinbase: None,
+                    txinwitness: vec![],
+                }],
+                vout: vec![],
+            }],
+        };
+        db.commit_block(&block1, 0, 4, 1, &mut index, None).unwrap();
+        let block2 = Block {
+            hash: "22".repeat(32),
+            height: 2,
+            previousblockhash: Some(block1.hash.clone()),
+            tx: vec![],
+        };
+        db.commit_block(&block2, 0, 4, 1, &mut index, None).unwrap();
+
+        let stored_outputs: u64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM p2tr_outputs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored_outputs, 0);
+        assert_eq!(db.status().unwrap().oldest_reorg_safe_height, Some(2));
+
+        assert_eq!(db.rollback_tip().unwrap(), Some(2));
+        let error = db.rollback_tip().unwrap_err().to_string();
+        assert!(error.contains("compact storage only retains rollback state"));
+        assert_eq!(db.status().unwrap().scanned_blocks, 2);
+    }
+
+    #[test]
     fn candidate_weak_leaf_matches_later_unspent_output_key() {
         let file = NamedTempFile::new().unwrap();
         let mut db = Database::open(file.path()).unwrap();
-        db.prepare_scan("main", 709_632, 709_634, 709_632).unwrap();
+        db.prepare_scan("main", 709_632, 709_634, 709_632, 144)
+            .unwrap();
         let mut index = HashMap::new();
         let funding_txid = "11".repeat(32);
         let output_key = "f1f9462868873c84f8a475307a26116f5f74c1caa5d7458f418ed97a399bc5b4";
@@ -981,7 +1176,7 @@ mod tests {
                 }],
             }],
         };
-        db.commit_block(&block1, 709_632, 4, &mut index, None)
+        db.commit_block(&block1, 709_632, 4, 144, &mut index, None)
             .unwrap();
 
         let script = concat!(
@@ -1014,7 +1209,7 @@ mod tests {
             }],
         };
         let block2_counts = db
-            .commit_block(&block2, 709_632, 4, &mut index, None)
+            .commit_block(&block2, 709_632, 4, 144, &mut index, None)
             .unwrap();
         assert_eq!(block2_counts.analyzed_scripts, 1);
         assert_eq!(block2_counts.candidate_weak_scripts, 1);
@@ -1042,7 +1237,7 @@ mod tests {
                 }],
             }],
         };
-        db.commit_block(&block3, 709_632, 4, &mut index, None)
+        db.commit_block(&block3, 709_632, 4, 144, &mut index, None)
             .unwrap();
         let report = db.report().unwrap();
         assert_eq!(report.risks.len(), 1);
@@ -1090,7 +1285,7 @@ mod tests {
             }],
         };
         let block4_counts = db
-            .commit_block(&block4, 709_632, 4, &mut index, None)
+            .commit_block(&block4, 709_632, 4, 144, &mut index, None)
             .unwrap();
         assert_eq!(block4_counts.candidate_weak_scripts, 0);
         assert_eq!(block4_counts.confirmed_weak_scripts, 1);

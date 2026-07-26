@@ -2,11 +2,16 @@ use std::{
     fs,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
+    thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
+use reqwest::{
+    StatusCode,
+    blocking::{Client, Response},
+    header::RETRY_AFTER,
+};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
@@ -28,10 +33,40 @@ pub struct RpcClient {
     auth: ResolvedAuth,
     client: Client,
     next_id: AtomicU64,
+    options: RpcOptions,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RpcOptions {
+    pub timeout: Duration,
+    pub max_retries: u32,
+    pub retry_initial_delay: Duration,
+    pub retry_max_delay: Duration,
+}
+
+impl Default for RpcOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(180),
+            max_retries: 5,
+            retry_initial_delay: Duration::from_secs(1),
+            retry_max_delay: Duration::from_secs(30),
+        }
+    }
 }
 
 impl RpcClient {
     pub fn new(url: String, auth: Auth) -> Result<Self> {
+        Self::with_options(url, auth, RpcOptions::default())
+    }
+
+    pub fn with_options(url: String, auth: Auth, options: RpcOptions) -> Result<Self> {
+        if options.timeout.is_zero() {
+            bail!("RPC timeout must be greater than zero");
+        }
+        if options.retry_max_delay < options.retry_initial_delay {
+            bail!("RPC maximum retry delay must not be smaller than the initial delay");
+        }
         let auth = match auth {
             Auth::None => ResolvedAuth::None,
             Auth::UserPassword { user, password } => ResolvedAuth::UserPassword { user, password },
@@ -49,7 +84,7 @@ impl RpcClient {
             }
         };
         let client = Client::builder()
-            .timeout(Duration::from_secs(180))
+            .timeout(options.timeout)
             .build()
             .context("build HTTP client")?;
         Ok(Self {
@@ -57,6 +92,7 @@ impl RpcClient {
             auth,
             client,
             next_id: AtomicU64::new(1),
+            options,
         })
     }
 
@@ -68,23 +104,107 @@ impl RpcClient {
             "method": method,
             "params": params,
         });
-        let mut request = self.client.post(&self.url).json(&body);
-        if let ResolvedAuth::UserPassword { user, password } = &self.auth {
-            request = request.basic_auth(user, Some(password));
+        for attempt in 0..=self.options.max_retries {
+            let mut request = self.client.post(&self.url).json(&body);
+            if let ResolvedAuth::UserPassword { user, password } = &self.auth {
+                request = request.basic_auth(user, Some(password));
+            }
+            let response = match request.send() {
+                Ok(response) => response,
+                Err(error) if is_retryable_transport_error(&error) => {
+                    if self.retry(method, attempt, "transport_error", None) {
+                        continue;
+                    }
+                    bail!(
+                        "RPC {method} request failed after retries ({})",
+                        transport_error_kind(&error)
+                    );
+                }
+                Err(error) => {
+                    bail!(
+                        "RPC {method} request failed ({})",
+                        transport_error_kind(&error)
+                    );
+                }
+            };
+            let status = response.status();
+            if is_retryable_status(status) {
+                let retry_after = retry_after(&response);
+                if self.retry(
+                    method,
+                    attempt,
+                    &format!("http_{}", status.as_u16()),
+                    retry_after,
+                ) {
+                    continue;
+                }
+                bail!(
+                    "RPC {method} returned retryable HTTP {status} after {} attempts",
+                    attempt + 1
+                );
+            }
+            if !status.is_success() {
+                bail!("RPC {method} returned HTTP {status}");
+            }
+            let envelope: RpcEnvelope<T> = match response.json() {
+                Ok(envelope) => envelope,
+                Err(_error) => {
+                    if self.retry(method, attempt, "invalid_response", None) {
+                        continue;
+                    }
+                    bail!("decode RPC {method} response (HTTP {status}) after retries");
+                }
+            };
+            if let Some(error) = envelope.error {
+                if is_retryable_rpc_error(error.code)
+                    && self.retry(method, attempt, &format!("rpc_{}", error.code), None)
+                {
+                    continue;
+                }
+                bail!("RPC {method} failed ({}): {}", error.code, error.message);
+            }
+            return envelope
+                .result
+                .with_context(|| format!("RPC {method} returned no result"));
         }
-        let response = request
-            .send()
-            .with_context(|| format!("RPC {method} request failed"))?;
-        let status = response.status();
-        let envelope: RpcEnvelope<T> = response
-            .json()
-            .with_context(|| format!("decode RPC {method} response (HTTP {status})"))?;
-        if let Some(error) = envelope.error {
-            bail!("RPC {method} failed ({}): {}", error.code, error.message);
+        unreachable!("RPC attempt loop always returns")
+    }
+
+    fn retry(
+        &self,
+        method: &str,
+        attempt: u32,
+        reason: &str,
+        retry_after: Option<Duration>,
+    ) -> bool {
+        if attempt >= self.options.max_retries {
+            return false;
         }
-        envelope
-            .result
-            .with_context(|| format!("RPC {method} returned no result"))
+        let delay = self.retry_delay(attempt, retry_after);
+        eprintln!(
+            "rpc_retry method={method} retry={}/{} reason={reason} delay_ms={}",
+            attempt + 1,
+            self.options.max_retries,
+            delay.as_millis()
+        );
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+        true
+    }
+
+    fn retry_delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+        let multiplier = 1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
+        let exponential = self
+            .options
+            .retry_initial_delay
+            .checked_mul(multiplier)
+            .unwrap_or(self.options.retry_max_delay)
+            .min(self.options.retry_max_delay);
+        retry_after
+            .unwrap_or_default()
+            .max(exponential)
+            .min(self.options.retry_max_delay)
     }
 
     pub fn blockchain_info(&self) -> Result<BlockchainInfo> {
@@ -98,6 +218,56 @@ impl RpcClient {
     pub fn block(&self, hash: &str) -> Result<Block> {
         self.call("getblock", json!([hash, 2]))
     }
+}
+
+fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_body()
+}
+
+fn transport_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_body() {
+        "response_body"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_builder() {
+        "request_build"
+    } else {
+        "transport"
+    }
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_EARLY
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn is_retryable_rpc_error(code: i64) -> bool {
+    // Bitcoin Core uses -28 while warming up or loading chain state.
+    code == -28
+}
+
+fn retry_after(response: &Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 #[derive(Deserialize)]
@@ -251,6 +421,12 @@ fn btc_to_sats(text: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
     use super::*;
 
     #[test]
@@ -279,5 +455,80 @@ mod tests {
         let scientific: BtcAmount = serde_json::from_str("6e-6").unwrap();
         assert_eq!(fixed.0, 600);
         assert_eq!(scientific.0, 600);
+    }
+
+    #[test]
+    fn retries_retryable_http_status_then_succeeds() {
+        let url = serve_responses(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_owned(),
+            json_response(r#"{"jsonrpc":"2.0","id":1,"result":42,"error":null}"#),
+        ]);
+        let client = test_client(url, 2);
+
+        let result: u64 = client.call("test", json!([])).unwrap();
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn retries_malformed_success_response_then_succeeds() {
+        let url = serve_responses(vec![
+            json_response(r#"{"jsonrpc":"2.0","id":1,"result":not-json}"#),
+            json_response(r#"{"jsonrpc":"2.0","id":1,"result":7,"error":null}"#),
+        ]);
+        let client = test_client(url, 1);
+
+        let result: u64 = client.call("test", json!([])).unwrap();
+
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn transport_errors_do_not_expose_the_rpc_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let secret = "provider-key-must-not-appear";
+        let client = test_client(format!("http://{address}/{secret}"), 0);
+
+        let error = client
+            .call::<u64>("test", json!([]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(!error.contains(secret));
+        assert!(!error.contains(&address.to_string()));
+    }
+
+    fn test_client(url: String, max_retries: u32) -> RpcClient {
+        RpcClient::with_options(url, Auth::None, RpcOptions {
+            timeout: Duration::from_secs(2),
+            max_retries,
+            retry_initial_delay: Duration::ZERO,
+            retry_max_delay: Duration::ZERO,
+        })
+        .unwrap()
+    }
+
+    fn json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn serve_responses(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{address}")
     }
 }

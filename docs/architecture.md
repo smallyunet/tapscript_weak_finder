@@ -65,8 +65,9 @@ The scanner calls `getblockchaininfo` to obtain:
 - current block height;
 - pruning status.
 
-A non-pruned node is currently required. The target height defaults to the node
-tip and cannot exceed it.
+A non-pruned node is currently required. The target height defaults to a
+snapshot of the node tip taken at startup and cannot exceed it. The target is
+not advanced during the run; reaching it is a normal terminal condition.
 
 The default Taproot activation heights are:
 
@@ -123,17 +124,23 @@ All database changes for a block are committed in one SQLite transaction:
 - next-height checkpoint;
 - last block hash.
 
+Complete block and transaction RPC responses are never stored.
+
 An interruption between blocks leaves the last committed checkpoint resumable.
 The corresponding `block_result` is emitted only after that block transaction
 commits, so every printed height is a durable resume boundary.
 
 ### 5. Reorganization reconciliation
 
-Before resuming, the scanner compares its last committed block hash with the
-node's canonical hash at the same height. A successfully retrieved mismatching
-hash rolls back the local tip, one block at a time, until a common ancestor is
-found. RPC transport, authentication, timeout, and server errors abort
+Before resuming, the scanner compares stored block hashes with the node's
+canonical hashes and first identifies the common ancestor without changing the
+database. RPC transport, authentication, timeout, and server errors abort
 reconciliation without authorizing rollback.
+
+Spent P2TR rows are retained only for the configured rollback window, 144
+blocks by default. If the common ancestor would require older pruned state,
+reconciliation fails before any rollback. Otherwise the local tip is rolled
+back one block at a time.
 
 Rollback:
 
@@ -264,6 +271,12 @@ The report joins candidate weaknesses with all currently unspent P2TR outputs
 having the same output key. Reusing the exact output key means reusing the same
 Taproot commitment, so the already-verified weak leaf is committed there as
 well.
+
+`p2tr_outputs` is a compact state index rather than a block archive. Unspent
+rows remain until spent; spent rows remain only inside the reorganization
+window and are then deleted. `scanned_blocks` contains hashes and aggregate
+counts, not block bodies. Revelation and analysis tables retain the evidence
+needed to reproduce detection results.
 
 ## Trust boundaries
 

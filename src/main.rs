@@ -11,7 +11,7 @@ mod rpc;
 mod scanner;
 mod taproot;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -22,7 +22,7 @@ use crate::{
     db::Database,
     detection::{CandidateValidator, ValidationEvidence},
     progress::ProgressMode,
-    rpc::{Auth, RpcClient},
+    rpc::{Auth, RpcClient, RpcOptions},
     scanner::{ScanConfig, Scanner},
 };
 
@@ -62,6 +62,22 @@ struct ScanArgs {
     #[arg(long, env = "BITCOIN_RPC_PASSWORD", requires = "rpc_user")]
     rpc_password: Option<String>,
 
+    /// Per-request HTTP timeout.
+    #[arg(long, env = "BITCOIN_RPC_TIMEOUT_SECS", default_value_t = 180)]
+    rpc_timeout_secs: u64,
+
+    /// Retries after transient transport, 408/429/5xx, warmup, or decode failures.
+    #[arg(long, env = "BITCOIN_RPC_MAX_RETRIES", default_value_t = 5)]
+    rpc_max_retries: u32,
+
+    /// Initial exponential retry delay.
+    #[arg(long, env = "BITCOIN_RPC_RETRY_INITIAL_MS", default_value_t = 1_000)]
+    rpc_retry_initial_ms: u64,
+
+    /// Maximum retry delay, including a server Retry-After value.
+    #[arg(long, env = "BITCOIN_RPC_RETRY_MAX_MS", default_value_t = 30_000)]
+    rpc_retry_max_ms: u64,
+
     /// Defaults to zero so the local P2TR UTXO view is complete.
     #[arg(long, default_value_t = 0)]
     start_height: u64,
@@ -80,6 +96,10 @@ struct ScanArgs {
 
     #[arg(long, default_value_t = 4)]
     max_witness_items: usize,
+
+    /// Keep spent P2TR rows only for this many recent blocks of reorg rollback.
+    #[arg(long, default_value_t = 144)]
+    reorg_retention_blocks: u64,
 
     /// Validate candidates using a fresh, isolated Bitcoin Core regtest node.
     #[arg(long, default_value_t = false)]
@@ -144,13 +164,19 @@ fn main() -> Result<()> {
                 (None, None, None) => Auth::None,
                 _ => anyhow::bail!("use either --rpc-cookie or --rpc-user/--rpc-password"),
             };
-            let rpc = RpcClient::new(args.rpc_url, auth)?;
+            let rpc = RpcClient::with_options(args.rpc_url, auth, RpcOptions {
+                timeout: Duration::from_secs(args.rpc_timeout_secs),
+                max_retries: args.rpc_max_retries,
+                retry_initial_delay: Duration::from_millis(args.rpc_retry_initial_ms),
+                retry_max_delay: Duration::from_millis(args.rpc_retry_max_ms),
+            })?;
             let config = ScanConfig {
                 requested_start_height: args.start_height,
                 requested_end_height: args.end_height,
                 taproot_activation_height: args.taproot_activation_height,
                 progress_mode: args.output.into(),
                 max_witness_items: args.max_witness_items,
+                reorg_retention_blocks: args.reorg_retention_blocks,
             };
             let scanner = Scanner::new(rpc, &mut db, config);
             if args.verify_with_bitcoin_core {
