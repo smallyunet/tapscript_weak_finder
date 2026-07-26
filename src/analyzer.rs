@@ -729,6 +729,25 @@ mod tests {
     }
 
     #[test]
+    fn finds_fixed_mainnet_reveal_minimal_proof() {
+        let script = hex::decode(concat!(
+            "20",
+            "fa9b5ec193f735c41b804fc6ace1d28e81a299fc815c0f5009dd2dd7d0293c3b",
+            "ac63",
+            "20",
+            "51bb73b4a36470cca81fba01fb52a5706052e7240c8d51f4d8085feaa4230839",
+            "68"
+        ))
+        .unwrap();
+
+        let result = analyze_script(&script, 4);
+
+        assert!(matches!(result.status, AnalysisStatus::Weak));
+        assert_eq!(result.proof_witness.unwrap(), vec!["01", ""]);
+        assert_eq!(result.valid_signatures_required, 0);
+    }
+
+    #[test]
     fn normal_checksig_has_no_signatureless_proof() {
         let script = hex::decode(format!("20{}ac", "11".repeat(32))).unwrap();
         let result = analyze_script(&script, 2);

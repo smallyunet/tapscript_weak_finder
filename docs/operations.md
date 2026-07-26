@@ -60,6 +60,11 @@ environment variables:
 --max-in-memory-p2tr-utxos / TAPSCRIPT_MAX_IN_MEMORY_P2TR_UTXOS
 ```
 
+The process loads `.env` from the working directory when present. Existing
+process environment variables take precedence. `.env` is ignored by Git and
+should be mode `0600` on a multi-user host; `.env.example` contains only safe
+placeholders.
+
 `--rpc-max-response-mib` defaults to 64 MiB. Responses above the limit are not
 retried because raising the limit is an operator decision. JSON is parsed from
 the limited stream without first copying the complete response into a second
@@ -322,6 +327,21 @@ Run the opt-in local Core integration test with:
 BITCOIND_PATH=/path/to/bitcoind \
   cargo test bitcoin_core_confirms_the_motivating_signatureless_path -- --ignored
 ```
+
+Run the fixed historical mainnet E2E test with `BITCOIN_RPC_URL` configured in
+the environment or local `.env`:
+
+```bash
+cargo test \
+  scanner::tests::mainnet_forum_incident_is_detected_via_read_only_rpc \
+  -- --ignored
+```
+
+This test performs only `getblockchaininfo`, `getblockhash`, and decoded
+`getblock` reads. It scans funding height `959019` and reveal height `959020`,
+then requires the known revealing transaction to have persisted
+`candidate_weak` evidence. It is ignored during ordinary test runs so CI does
+not depend on a provider credential or external chain availability.
 
 ## Troubleshooting
 

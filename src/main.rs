@@ -169,6 +169,8 @@ struct ReportArgs {
 }
 
 fn main() -> Result<()> {
+    // Local operator convenience; explicit process environment still wins.
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     let mut db = Database::open(&cli.db)?;
 

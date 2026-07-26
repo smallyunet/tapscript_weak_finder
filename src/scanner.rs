@@ -197,3 +197,58 @@ fn default_activation_height(chain: &str) -> u64 {
         _ => 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use tempfile::NamedTempFile;
+
+    use super::*;
+    use crate::rpc::{Auth, RpcOptions};
+
+    const FORUM_FUNDING_HEIGHT: u64 = 959_019;
+    const FORUM_REVEAL_HEIGHT: u64 = 959_020;
+    const FORUM_REVEAL_TXID: &str =
+        "56f4c8b2c11ce6010637f8f831ad03430bc1686fc39d4833ec0281ddbef01a22";
+    const FORUM_SCRIPT_HEX: &str = concat!(
+        "20",
+        "fa9b5ec193f735c41b804fc6ace1d28e81a299fc815c0f5009dd2dd7d0293c3b",
+        "ac63",
+        "20",
+        "51bb73b4a36470cca81fba01fb52a5706052e7240c8d51f4d8085feaa4230839",
+        "68"
+    );
+
+    #[test]
+    #[ignore = "requires BITCOIN_RPC_URL with read access to fixed mainnet blocks"]
+    fn mainnet_forum_incident_is_detected_via_read_only_rpc() {
+        let _ = dotenvy::dotenv();
+        let rpc_url =
+            env::var("BITCOIN_RPC_URL").expect("BITCOIN_RPC_URL must be set for this E2E test");
+        let rpc = RpcClient::with_options(rpc_url, Auth::None, RpcOptions::default()).unwrap();
+        let file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(file.path()).unwrap();
+        let config = ScanConfig {
+            requested_start_height: FORUM_FUNDING_HEIGHT,
+            requested_end_height: Some(FORUM_REVEAL_HEIGHT),
+            taproot_activation_height: None,
+            progress_mode: ProgressMode::None,
+            max_witness_items: 4,
+            reorg_retention_blocks: 144,
+            min_free_disk_bytes: 0,
+            max_in_memory_p2tr_utxos: 100_000,
+        };
+
+        Scanner::new(rpc, &mut db, config).run().unwrap();
+
+        let status = db.status().unwrap();
+        assert_eq!(status.scanned_blocks, 2);
+        let detection = db
+            .detection_for_revelation(FORUM_REVEAL_TXID)
+            .unwrap()
+            .expect("known reveal transaction must have persisted analysis");
+        assert_eq!(detection.0, "candidate_weak");
+        assert_eq!(detection.1, FORUM_SCRIPT_HEX);
+    }
+}

@@ -228,6 +228,10 @@ TAPSCRIPT_MIN_FREE_DISK_MIB
 TAPSCRIPT_MAX_IN_MEMORY_P2TR_UTXOS
 ```
 
+The binary loads a local `.env` automatically, without overriding variables
+already present in the process environment. Copy `.env.example` and keep the
+real RPC endpoint only in `.env`; the repository ignores `.env` files.
+
 Read RPCs retry transient transport failures, HTTP 408/425/429/5xx responses,
 Bitcoin Core warmup errors, and malformed success responses. Defaults are five
 retries with exponential delays from one to thirty seconds. Authentication and
@@ -302,11 +306,23 @@ The repository is a functional research prototype:
 - Reorganization reconciliation propagates RPC failures instead of treating
   them as canonical-hash mismatches.
 - Transient HTTP and malformed-response retry paths have fault-injection tests.
+- An opt-in read-only mainnet E2E test scans fixed heights `959019..=959020`
+  and asserts that revealing transaction
+  `56f4c8b2c11ce6010637f8f831ad03430bc1686fc39d4833ec0281ddbef01a22`
+  is persisted as `candidate_weak`.
 - Broader differential and reorganization tests, transaction-context semantics,
   search-space expansion, and mainnet-scale benchmarks are still needed.
 
 Do not use the current scanner unattended against an irreplaceable database.
 Keep backups and validate findings independently.
+
+Run the fixed-chain E2E test with a read-only RPC configured in `.env`:
+
+```bash
+cargo test \
+  scanner::tests::mainnet_forum_incident_is_detected_via_read_only_rpc \
+  -- --ignored
+```
 
 ## Protocol references
 

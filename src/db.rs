@@ -857,6 +857,27 @@ impl Database {
             .optional()?)
     }
 
+    #[cfg(test)]
+    pub fn detection_for_revelation(
+        &self,
+        spending_txid: &str,
+    ) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT a.detection_status, lower(hex(l.script))
+                 FROM revelation_events e
+                 JOIN analysis_runs a ON a.tapleaf_id=e.tapleaf_id
+                 JOIN tapleaves l ON l.id=e.tapleaf_id
+                 WHERE e.spending_txid=?1
+                 ORDER BY e.spending_input_index
+                 LIMIT 1",
+                [spending_txid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
     pub fn ensure_reorg_can_rollback_from(&self, first_height: u64) -> Result<()> {
         let oldest = get_meta(&self.conn, "oldest_reorg_safe_height")?
             .map(|value| {
