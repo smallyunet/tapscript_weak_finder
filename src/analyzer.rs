@@ -777,7 +777,7 @@ fn execute_opcode(
             else {
                 return OpcodeResult::Fail;
             };
-            let Some(result) = n.checked_add(success as i64) else {
+            let Some(result) = n.checked_add(i64::from(success)) else {
                 return OpcodeResult::Fail;
             };
             stack.push(encode_script_num(result));
@@ -799,8 +799,13 @@ fn signature_result(
         return Some(false);
     }
     if pubkey.len() == 32 {
+        // A non-empty signature for a 32-byte key is either a valid Schnorr
+        // signature or a consensus failure. This search does not produce a
+        // valid signature, so the candidate fails closed.
         return None;
     }
+    // Unknown public-key types stay in execution. A non-empty signature makes
+    // this opcode succeed; later opcodes still run.
     *unknown_pubkey_success = true;
     Some(true)
 }
@@ -926,6 +931,25 @@ mod tests {
         assert!(matches!(result.status, AnalysisStatus::Weak));
         assert_eq!(result.proof_witness.unwrap(), vec!["01", ""]);
         assert_eq!(result.valid_signatures_required, 0);
+    }
+
+    #[test]
+    fn unknown_pubkey_with_nonempty_signature_is_upgradable() {
+        let result = analyze_script(&[0x51, 0xac], 1);
+
+        assert!(matches!(result.status, AnalysisStatus::Weak));
+        assert_eq!(
+            result.vulnerability_class.as_deref(),
+            Some("upgradable_pubkey_type")
+        );
+        assert_eq!(result.proof_witness.unwrap(), vec!["01"]);
+    }
+
+    #[test]
+    fn later_opcodes_still_run_after_an_unknown_pubkey() {
+        let result = analyze_script(&[0x51, 0xac, 0x00], 1);
+
+        assert!(matches!(result.status, AnalysisStatus::NoProofFound));
     }
 
     #[test]

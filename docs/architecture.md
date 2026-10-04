@@ -188,12 +188,19 @@ conditionals, common stack operations, comparisons, arithmetic, hashes,
 `OP_CHECKSIG`, `OP_CHECKSIGVERIFY`, and `OP_CHECKSIGADD`. It also recognizes
 `OP_SUCCESSx` and upgradeable public-key behavior.
 
+An unknown public-key type with a non-empty signature makes that signature
+opcode succeed, and later opcodes still run. A 32-byte key with a non-empty
+signature fails the candidate, because this search cannot produce a valid
+Schnorr signature and Bitcoin Core fails the script for an invalid one.
+
 This is a search strategy, not a complete symbolic executor and not an
 authoritative consensus implementation. Candidate witnesses may be replayed in
 a freshly created isolated Bitcoin Core regtest. An accepted
 `testmempoolaccept` result establishes both consensus and current-policy
-acceptance. A generic rejection does not identify which layer failed, so both
-fields remain inconclusive. See
+acceptance. A `non-mandatory-script-verify-flag` rejection records consensus
+validity separately from policy rejection. A `mandatory-script-verify-flag`
+rejection records a consensus failure. Any other rejection leaves both fields
+inconclusive. See
 [Detection model and limitations](detection-model.md).
 
 ## Storage model
@@ -316,5 +323,5 @@ begins.
 | BIP 341 commitment verification | Locally recomputed from revealed evidence. |
 | SQLite checkpoint | Durable per committed block; RPC failure alone cannot authorize rollback. |
 | Custom analyzer result | Candidate generation and explanation only. |
-| Isolated Bitcoin Core validator | Authority for accepted synthetic candidates; generic rejections leave both consensus and policy inconclusive. |
+| Isolated Bitcoin Core validator | Authority for accepted synthetic candidates. Script-flag reject reasons separate consensus from policy; other rejections leave both inconclusive. |
 | Social or legal ownership | Explicitly out of scope. |

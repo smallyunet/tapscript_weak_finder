@@ -63,8 +63,11 @@ Use evidence-based states consistently:
   Core consensus-validation path without requiring a valid signature.
 - `candidate_weak`: the local analyzer found a candidate witness, but
   authoritative validation is incomplete.
-- `policy_rejected`: consensus validity may differ from current standard mempool
-  policy; do not describe policy rejection as consensus failure.
+- `policy_rejected`: mandatory script checks passed, but current standard
+  mempool policy rejected the synthetic spend. Do not describe this as a
+  consensus failure.
+- `consensus_invalid`: Bitcoin Core rejected the candidate under consensus
+  script rules. Do not report it as a spendable risk.
 - `no_proof_found`: no witness was found inside the configured search space; it
   is not a safety proof.
 - `inconclusive`: required semantics, transaction context, or validation

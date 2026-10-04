@@ -57,7 +57,9 @@ pub struct BlockCounts {
     pub analyzed_scripts: u64,
     pub weak_scripts: u64,
     pub confirmed_weak_scripts: u64,
+    pub policy_rejected_scripts: u64,
     pub candidate_weak_scripts: u64,
+    pub consensus_invalid_scripts: u64,
     pub no_proof_found_scripts: u64,
     pub inconclusive_scripts: u64,
     pub invalid_script_scripts: u64,
@@ -82,7 +84,9 @@ pub struct Status {
     pub weak_scripts: u64,
     pub analyzed_scripts: u64,
     pub confirmed_weak_scripts: u64,
+    pub policy_rejected_scripts: u64,
     pub candidate_weak_scripts: u64,
+    pub consensus_invalid_scripts: u64,
     pub no_proof_found_scripts: u64,
     pub inconclusive_scripts: u64,
     pub invalid_script_scripts: u64,
@@ -544,128 +548,43 @@ impl Database {
                                     |row| row.get::<_, String>(0),
                                 )
                                 .optional()?;
-                            let should_replace_weakness = prior_detection_status.as_deref()
-                                != Some("confirmed_weak")
-                                || matches!(
-                                    evidence.detection_status,
-                                    DetectionStatus::ConfirmedWeak
-                                );
-                            tx.execute(
-                                r#"
-                                INSERT INTO analysis_runs(
-                                    tapleaf_id, analysis_status, detection_status,
-                                    analyzer_version, search_config_json, consensus_status,
-                                    policy_status, validator, validation_details, analyzed_at_unix
-                                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                                ON CONFLICT(tapleaf_id) DO UPDATE SET
-                                    analysis_status=CASE
-                                        WHEN analysis_runs.detection_status='confirmed_weak'
-                                          OR (
-                                            analysis_runs.detection_status='candidate_weak'
-                                            AND excluded.detection_status NOT IN (
-                                                'candidate_weak', 'confirmed_weak'
-                                            )
-                                          )
-                                        THEN analysis_runs.analysis_status
-                                        ELSE excluded.analysis_status
-                                    END,
-                                    detection_status=CASE
-                                        WHEN analysis_runs.detection_status='confirmed_weak'
-                                        THEN analysis_runs.detection_status
-                                        WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status NOT IN (
-                                              'candidate_weak', 'confirmed_weak'
-                                          )
-                                        THEN analysis_runs.detection_status
-                                        ELSE excluded.detection_status
-                                    END,
-                                    analyzer_version=CASE
-                                        WHEN analysis_runs.detection_status='confirmed_weak'
-                                          OR (
-                                            analysis_runs.detection_status='candidate_weak'
-                                            AND excluded.detection_status NOT IN (
-                                                'candidate_weak', 'confirmed_weak'
-                                            )
-                                          )
-                                        THEN analysis_runs.analyzer_version
-                                        ELSE excluded.analyzer_version
-                                    END,
-                                    search_config_json=CASE
-                                        WHEN analysis_runs.detection_status='confirmed_weak'
-                                          OR (
-                                            analysis_runs.detection_status='candidate_weak'
-                                            AND excluded.detection_status NOT IN (
-                                                'candidate_weak', 'confirmed_weak'
-                                            )
-                                          )
-                                        THEN analysis_runs.search_config_json
-                                        ELSE excluded.search_config_json
-                                    END,
-                                    consensus_status=CASE
-                                        WHEN analysis_runs.detection_status='confirmed_weak'
-                                        THEN analysis_runs.consensus_status
-                                        WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status NOT IN (
-                                              'candidate_weak', 'confirmed_weak'
-                                          )
-                                        THEN analysis_runs.consensus_status
-                                        ELSE excluded.consensus_status
-                                    END,
-                                    policy_status=CASE
-                                        WHEN analysis_runs.detection_status='confirmed_weak'
-                                        THEN analysis_runs.policy_status
-                                        WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status NOT IN (
-                                              'candidate_weak', 'confirmed_weak'
-                                          )
-                                        THEN analysis_runs.policy_status
-                                        ELSE excluded.policy_status
-                                    END,
-                                    validator=CASE
-                                        WHEN analysis_runs.detection_status='confirmed_weak'
-                                        THEN analysis_runs.validator
-                                        WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status NOT IN (
-                                              'candidate_weak', 'confirmed_weak'
-                                          )
-                                        THEN analysis_runs.validator
-                                        ELSE excluded.validator
-                                    END,
-                                    validation_details=CASE
-                                        WHEN analysis_runs.detection_status='confirmed_weak'
-                                        THEN analysis_runs.validation_details
-                                        WHEN analysis_runs.detection_status='candidate_weak'
-                                          AND excluded.detection_status NOT IN (
-                                              'candidate_weak', 'confirmed_weak'
-                                          )
-                                        THEN analysis_runs.validation_details
-                                        ELSE excluded.validation_details
-                                    END,
-                                    analyzed_at_unix=CASE
-                                        WHEN analysis_runs.detection_status='confirmed_weak'
-                                          OR (
-                                            analysis_runs.detection_status='candidate_weak'
-                                            AND excluded.detection_status NOT IN (
-                                                'candidate_weak', 'confirmed_weak'
-                                            )
-                                          )
-                                        THEN analysis_runs.analyzed_at_unix
-                                        ELSE excluded.analyzed_at_unix
-                                    END
-                                "#,
-                                params![
-                                    tapleaf_id,
-                                    analysis.status.as_str(),
-                                    evidence.detection_status.as_str(),
-                                    ANALYZER_VERSION,
-                                    serde_json::to_string(&search_config)?,
-                                    evidence.consensus_status.as_str(),
-                                    evidence.policy_status.as_str(),
-                                    evidence.validator,
-                                    evidence.details,
-                                    unix_timestamp(),
-                                ],
-                            )?;
+                            let retain_prior =
+                                prior_detection_status.as_deref().is_some_and(|prior| {
+                                    retain_prior_detection(prior, evidence.detection_status)
+                                });
+                            if !retain_prior {
+                                tx.execute(
+                                    r#"
+                                    INSERT INTO analysis_runs(
+                                        tapleaf_id, analysis_status, detection_status,
+                                        analyzer_version, search_config_json, consensus_status,
+                                        policy_status, validator, validation_details, analyzed_at_unix
+                                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                    ON CONFLICT(tapleaf_id) DO UPDATE SET
+                                        analysis_status=excluded.analysis_status,
+                                        detection_status=excluded.detection_status,
+                                        analyzer_version=excluded.analyzer_version,
+                                        search_config_json=excluded.search_config_json,
+                                        consensus_status=excluded.consensus_status,
+                                        policy_status=excluded.policy_status,
+                                        validator=excluded.validator,
+                                        validation_details=excluded.validation_details,
+                                        analyzed_at_unix=excluded.analyzed_at_unix
+                                    "#,
+                                    params![
+                                        tapleaf_id,
+                                        analysis.status.as_str(),
+                                        evidence.detection_status.as_str(),
+                                        ANALYZER_VERSION,
+                                        serde_json::to_string(&search_config)?,
+                                        evidence.consensus_status.as_str(),
+                                        evidence.policy_status.as_str(),
+                                        evidence.validator,
+                                        evidence.details,
+                                        unix_timestamp(),
+                                    ],
+                                )?;
+                            }
                             let effective_detection_status: String = tx.query_row(
                                 "SELECT detection_status FROM analysis_runs WHERE tapleaf_id=?1",
                                 [tapleaf_id],
@@ -673,15 +592,21 @@ impl Database {
                             )?;
                             match effective_detection_status.as_str() {
                                 "confirmed_weak" => counts.confirmed_weak_scripts += 1,
+                                "policy_rejected" => counts.policy_rejected_scripts += 1,
                                 "candidate_weak" => counts.candidate_weak_scripts += 1,
+                                "consensus_invalid" => counts.consensus_invalid_scripts += 1,
                                 "no_proof_found" => counts.no_proof_found_scripts += 1,
                                 "inconclusive" => counts.inconclusive_scripts += 1,
                                 "invalid_script" => counts.invalid_script_scripts += 1,
                                 value => bail!("stored unknown detection status {value}"),
                             }
+                            let reportable_weakness = matches!(
+                                effective_detection_status.as_str(),
+                                "confirmed_weak" | "policy_rejected" | "candidate_weak"
+                            );
                             if matches!(analysis.status, AnalysisStatus::Weak) {
                                 counts.weak_scripts += 1;
-                                if should_replace_weakness {
+                                if !retain_prior && reportable_weakness {
                                     let vulnerability_class = analysis
                                         .vulnerability_class
                                         .as_deref()
@@ -716,6 +641,11 @@ impl Database {
                                         ],
                                     )?;
                                 }
+                            }
+                            if !retain_prior && effective_detection_status == "consensus_invalid" {
+                                tx.execute("DELETE FROM weaknesses WHERE tapleaf_id=?1", [
+                                    tapleaf_id,
+                                ])?;
                             }
                             if effective_detection_status == "no_proof_found" {
                                 let has_prior_weakness: bool = tx.query_row(
@@ -1001,7 +931,9 @@ impl Database {
             SELECT
                 COUNT(*),
                 COALESCE(SUM(detection_status='confirmed_weak'), 0),
+                COALESCE(SUM(detection_status='policy_rejected'), 0),
                 COALESCE(SUM(detection_status='candidate_weak'), 0),
+                COALESCE(SUM(detection_status='consensus_invalid'), 0),
                 COALESCE(SUM(detection_status='no_proof_found'), 0),
                 COALESCE(SUM(detection_status='inconclusive'), 0),
                 COALESCE(SUM(detection_status='invalid_script'), 0)
@@ -1016,6 +948,8 @@ impl Database {
                     row.get::<_, u64>(3)?,
                     row.get::<_, u64>(4)?,
                     row.get::<_, u64>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, u64>(7)?,
                 ))
             },
         )?;
@@ -1056,10 +990,12 @@ impl Database {
             weak_scripts,
             analyzed_scripts: analysis_counts.0,
             confirmed_weak_scripts: analysis_counts.1,
-            candidate_weak_scripts: analysis_counts.2,
-            no_proof_found_scripts: analysis_counts.3,
-            inconclusive_scripts: analysis_counts.4,
-            invalid_script_scripts: analysis_counts.5,
+            policy_rejected_scripts: analysis_counts.2,
+            candidate_weak_scripts: analysis_counts.3,
+            consensus_invalid_scripts: analysis_counts.4,
+            no_proof_found_scripts: analysis_counts.5,
+            inconclusive_scripts: analysis_counts.6,
+            invalid_script_scripts: analysis_counts.7,
             retained_evidence_scripts: evidence_counts.0,
             compacted_no_proof_scripts: evidence_counts.1,
             current_p2tr_utxos: utxos,
@@ -1148,13 +1084,16 @@ impl Database {
             if outpoints.is_empty() {
                 continue;
             }
+            let (severity, confidence) = match detection_status.as_str() {
+                "confirmed_weak" => ("critical", "bitcoin_core_validated"),
+                "policy_rejected" => (
+                    "consensus_valid",
+                    "bitcoin_core_consensus_valid_policy_rejected",
+                ),
+                _ => ("candidate", "consensus_commitment_verified_candidate"),
+            };
             risks.push(RiskItem {
-                severity: if detection_status == "confirmed_weak" {
-                    "critical"
-                } else {
-                    "candidate"
-                }
-                .to_owned(),
+                severity: severity.to_owned(),
                 output_key: output_key.to_lowercase(),
                 current_balance_sats: balance,
                 utxo_count: outpoints.len(),
@@ -1170,12 +1109,7 @@ impl Database {
                 policy_status,
                 validator,
                 validation_details,
-                confidence: if detection_status == "confirmed_weak" {
-                    "bitcoin_core_validated"
-                } else {
-                    "consensus_commitment_verified_candidate"
-                }
-                .to_owned(),
+                confidence: confidence.to_owned(),
                 limitations: serde_json::from_str(&limitations_json)?,
             });
         }
@@ -1270,6 +1204,30 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn retain_prior_detection(prior: &str, incoming: DetectionStatus) -> bool {
+    match prior {
+        "confirmed_weak" => incoming != DetectionStatus::ConfirmedWeak,
+        "policy_rejected" => !matches!(
+            incoming,
+            DetectionStatus::ConfirmedWeak | DetectionStatus::PolicyRejected
+        ),
+        "consensus_invalid" => !matches!(
+            incoming,
+            DetectionStatus::ConfirmedWeak
+                | DetectionStatus::PolicyRejected
+                | DetectionStatus::ConsensusInvalid
+        ),
+        "candidate_weak" => !matches!(
+            incoming,
+            DetectionStatus::ConfirmedWeak
+                | DetectionStatus::PolicyRejected
+                | DetectionStatus::CandidateWeak
+                | DetectionStatus::ConsensusInvalid
+        ),
+        _ => false,
+    }
+}
+
 fn detection_status_for_analysis(status: AnalysisStatus) -> DetectionStatus {
     match status {
         AnalysisStatus::Weak => DetectionStatus::CandidateWeak,
@@ -1357,6 +1315,54 @@ mod tests {
     };
 
     use super::*;
+
+    struct FixedEvidence(ValidationEvidence);
+
+    impl CandidateValidator for FixedEvidence {
+        fn name(&self) -> &str {
+            "fixed-evidence"
+        }
+
+        fn validate(&mut self, _script: &[u8], _witness: &[Vec<u8>]) -> Result<ValidationEvidence> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn authoritative_detection_is_not_replaced_by_a_weaker_result() {
+        assert!(retain_prior_detection(
+            "confirmed_weak",
+            DetectionStatus::PolicyRejected
+        ));
+        assert!(retain_prior_detection(
+            "confirmed_weak",
+            DetectionStatus::ConsensusInvalid
+        ));
+        assert!(!retain_prior_detection(
+            "confirmed_weak",
+            DetectionStatus::ConfirmedWeak
+        ));
+        assert!(!retain_prior_detection(
+            "candidate_weak",
+            DetectionStatus::PolicyRejected
+        ));
+        assert!(!retain_prior_detection(
+            "candidate_weak",
+            DetectionStatus::ConsensusInvalid
+        ));
+        assert!(retain_prior_detection(
+            "policy_rejected",
+            DetectionStatus::CandidateWeak
+        ));
+        assert!(retain_prior_detection(
+            "consensus_invalid",
+            DetectionStatus::CandidateWeak
+        ));
+        assert!(!retain_prior_detection(
+            "consensus_invalid",
+            DetectionStatus::PolicyRejected
+        ));
+    }
 
     #[test]
     fn initializes_and_reopens_scan_state() {
@@ -1926,5 +1932,99 @@ mod tests {
         assert_eq!(report.risks[0].detection_status, "confirmed_weak");
         assert_eq!(report.risks[0].validator, "test-validator");
         assert_eq!(report.risks[0].proof_strategy, "confirmed_strategy");
+    }
+
+    #[test]
+    fn consensus_invalid_witness_is_not_reported_as_a_risk() {
+        let file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(file.path()).unwrap();
+        db.prepare_scan("main", 709_632, 709_633, 709_632, 144)
+            .unwrap();
+        let mut index = HashMap::new();
+        let output_key = "f1f9462868873c84f8a475307a26116f5f74c1caa5d7458f418ed97a399bc5b4";
+        let funding_txid = "11".repeat(32);
+        let block1 = Block {
+            hash: "b1".repeat(32),
+            height: 709_632,
+            previousblockhash: Some("00".repeat(32)),
+            tx: vec![RpcTransaction {
+                txid: funding_txid.clone(),
+                vin: vec![TxIn {
+                    txid: None,
+                    vout: None,
+                    coinbase: Some("00".to_owned()),
+                    txinwitness: vec![],
+                }],
+                vout: vec![TxOut {
+                    value: BtcAmount(10_000),
+                    n: 0,
+                    script_pub_key: ScriptPubKey {
+                        hex: format!("5120{output_key}"),
+                    },
+                }],
+            }],
+        };
+        db.commit_block(&block1, 709_632, 4, 144, &mut index, None)
+            .unwrap();
+        let script = concat!(
+            "20",
+            "fa9b5ec193f735c41b804fc6ace1d28e81a299fc815c0f5009dd2dd7d0293c3b",
+            "ac63",
+            "20",
+            "ff1275b635cd160914cfe1bc516f521abde0fc8ae3fd92ae01ca16449e4758e9",
+            "68"
+        );
+        let block2 = Block {
+            hash: "b2".repeat(32),
+            height: 709_633,
+            previousblockhash: Some(block1.hash),
+            tx: vec![RpcTransaction {
+                txid: "22".repeat(32),
+                vin: vec![TxIn {
+                    txid: Some(funding_txid),
+                    vout: Some(0),
+                    coinbase: None,
+                    txinwitness: vec![
+                        "51".to_owned(),
+                        String::new(),
+                        script.to_owned(),
+                        "c0fa9b5ec193f735c41b804fc6ace1d28e81a299fc815c0f5009dd2dd7d0293c3b"
+                            .to_owned(),
+                    ],
+                }],
+                vout: vec![TxOut {
+                    value: BtcAmount(9_000),
+                    n: 0,
+                    script_pub_key: ScriptPubKey {
+                        hex: format!("5120{output_key}"),
+                    },
+                }],
+            }],
+        };
+        let mut validator = FixedEvidence(ValidationEvidence {
+            detection_status: DetectionStatus::ConsensusInvalid,
+            consensus_status: ConsensusStatus::Invalid,
+            policy_status: PolicyStatus::NotChecked,
+            validator: "fixed-evidence".to_owned(),
+            details: Some("consensus rejected".to_owned()),
+        });
+        let counts = db
+            .commit_block(&block2, 709_632, 4, 144, &mut index, Some(&mut validator))
+            .unwrap();
+        assert_eq!(counts.consensus_invalid_scripts, 1);
+        assert_eq!(counts.candidate_weak_scripts, 0);
+        let stored: String = db
+            .conn
+            .query_row("SELECT detection_status FROM analysis_runs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, "consensus_invalid");
+        let weaknesses: u64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM weaknesses", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(weaknesses, 0);
+        assert!(db.report().unwrap().risks.is_empty());
     }
 }

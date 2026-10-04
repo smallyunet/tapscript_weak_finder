@@ -68,8 +68,10 @@ motivation and the limits imposed by Taproot privacy.
 - It cannot recover an unrevealed TapScript tree from a Taproot output key.
 - It cannot find every victim whose weak leaf has never appeared on chain.
 - It does not prove that `no_proof_found` means safe.
-- Its Core validator cannot always separate consensus validity from policy when
-  `testmempoolaccept` rejects a candidate; both evidence fields remain
+- When `testmempoolaccept` rejects a candidate, a
+  `non-mandatory-script-verify-flag` reason is recorded as consensus-valid and
+  `policy_rejected`. A `mandatory-script-verify-flag` reason is recorded as
+  `consensus_invalid`. Any other reason leaves both consensus and policy
   inconclusive.
 - It does not identify the wallet or tool that created a weak script.
 - It does not determine the legal or moral owner of a spendable output.
@@ -307,7 +309,9 @@ validator, and limitation evidence.
 | Status | Meaning |
 | --- | --- |
 | `confirmed_weak` | A synthetic equivalent was accepted by Bitcoin Core `testmempoolaccept` on isolated regtest. |
+| `policy_rejected` | Mandatory script checks passed, but current standard mempool policy rejected the synthetic spend. |
 | `candidate_weak` | The bounded analyzer found a witness, but Core validation was absent, failed, or rejected without separable consensus/policy evidence. |
+| `consensus_invalid` | Bitcoin Core rejected the witness under consensus script rules. It is not reported as a spendable risk. |
 | `no_proof_found` | No candidate was found inside the configured search space. This is not a safety proof. |
 | `inconclusive` | Execution reached semantics the analyzer does not support. |
 | `invalid_script` | The script could not be parsed by the analyzer. |

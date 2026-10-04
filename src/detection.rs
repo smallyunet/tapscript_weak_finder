@@ -5,7 +5,9 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 pub enum DetectionStatus {
     ConfirmedWeak,
+    PolicyRejected,
     CandidateWeak,
+    ConsensusInvalid,
     NoProofFound,
     Inconclusive,
     InvalidScript,
@@ -15,7 +17,9 @@ impl DetectionStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ConfirmedWeak => "confirmed_weak",
+            Self::PolicyRejected => "policy_rejected",
             Self::CandidateWeak => "candidate_weak",
+            Self::ConsensusInvalid => "consensus_invalid",
             Self::NoProofFound => "no_proof_found",
             Self::Inconclusive => "inconclusive",
             Self::InvalidScript => "invalid_script",
@@ -27,6 +31,7 @@ impl DetectionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ConsensusStatus {
     ConfirmedValid,
+    Invalid,
     NotChecked,
     Inconclusive,
 }
@@ -35,6 +40,7 @@ impl ConsensusStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ConfirmedValid => "confirmed_valid",
+            Self::Invalid => "invalid",
             Self::NotChecked => "not_checked",
             Self::Inconclusive => "inconclusive",
         }
@@ -45,6 +51,7 @@ impl ConsensusStatus {
 #[serde(rename_all = "snake_case")]
 pub enum PolicyStatus {
     Accepted,
+    Rejected,
     Inconclusive,
     NotChecked,
 }
@@ -53,6 +60,7 @@ impl PolicyStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
             Self::Inconclusive => "inconclusive",
             Self::NotChecked => "not_checked",
         }
@@ -106,8 +114,15 @@ mod tests {
     #[test]
     fn evidence_states_have_stable_storage_names() {
         assert_eq!(DetectionStatus::ConfirmedWeak.as_str(), "confirmed_weak");
+        assert_eq!(DetectionStatus::PolicyRejected.as_str(), "policy_rejected");
         assert_eq!(DetectionStatus::CandidateWeak.as_str(), "candidate_weak");
+        assert_eq!(
+            DetectionStatus::ConsensusInvalid.as_str(),
+            "consensus_invalid"
+        );
         assert_eq!(ConsensusStatus::ConfirmedValid.as_str(), "confirmed_valid");
+        assert_eq!(ConsensusStatus::Invalid.as_str(), "invalid");
+        assert_eq!(PolicyStatus::Rejected.as_str(), "rejected");
         assert_eq!(PolicyStatus::Inconclusive.as_str(), "inconclusive");
     }
 }

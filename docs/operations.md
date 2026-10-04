@@ -147,7 +147,9 @@ Important status fields:
 | `weak_scripts` | Leaves for which the bounded analyzer produced a weak witness, including candidate and Core-confirmed results. |
 | `analyzed_scripts` | Revealed `0xc0` leaves with persisted analysis coverage. |
 | `confirmed_weak_scripts` | Candidates accepted by the isolated Core validator. |
+| `policy_rejected_scripts` | Candidates whose mandatory script checks passed and whose standard policy checks failed. |
 | `candidate_weak_scripts` | Candidates without conclusive Core acceptance. |
+| `consensus_invalid_scripts` | Candidates rejected by consensus script rules. |
 | `retained_evidence_scripts` | TapLeaves whose complete script evidence remains stored. |
 | `compacted_no_proof_scripts` | `no_proof_found` TapLeaves retained as summaries. |
 | `current_p2tr_utxos` | Unspent P2TR outputs known to this database. |

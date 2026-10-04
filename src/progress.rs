@@ -47,7 +47,9 @@ struct BlockResult<'a> {
     analyzed_scripts: u64,
     analyzer_weak_scripts: u64,
     confirmed_weak_scripts: u64,
+    policy_rejected_scripts: u64,
     candidate_weak_scripts: u64,
+    consensus_invalid_scripts: u64,
     no_proof_found_scripts: u64,
     inconclusive_scripts: u64,
     invalid_script_scripts: u64,
@@ -73,7 +75,9 @@ struct ScanSummary {
     analyzed_scripts: u64,
     analyzer_weak_scripts: u64,
     confirmed_weak_scripts: u64,
+    policy_rejected_scripts: u64,
     candidate_weak_scripts: u64,
+    consensus_invalid_scripts: u64,
     no_proof_found_scripts: u64,
     inconclusive_scripts: u64,
     invalid_script_scripts: u64,
@@ -144,7 +148,9 @@ impl ProgressReporter {
             analyzed_scripts: counts.analyzed_scripts,
             analyzer_weak_scripts: counts.weak_scripts,
             confirmed_weak_scripts: counts.confirmed_weak_scripts,
+            policy_rejected_scripts: counts.policy_rejected_scripts,
             candidate_weak_scripts: counts.candidate_weak_scripts,
+            consensus_invalid_scripts: counts.consensus_invalid_scripts,
             no_proof_found_scripts: counts.no_proof_found_scripts,
             inconclusive_scripts: counts.inconclusive_scripts,
             invalid_script_scripts: counts.invalid_script_scripts,
@@ -168,14 +174,16 @@ impl ProgressReporter {
                     }
                 }
                 println!(
-                    "summary blocks={} tx={} leaves={} analyzed={} candidate={} confirmed={} \
-                     inconclusive={} interrupted={}",
+                    "summary blocks={} tx={} leaves={} analyzed={} candidate={} policy_rejected={} \
+                     confirmed={} consensus_invalid={} inconclusive={} interrupted={}",
                     summary.completed_blocks,
                     summary.transactions,
                     summary.revealed_script_paths,
                     summary.analyzed_scripts,
                     summary.candidate_weak_scripts,
+                    summary.policy_rejected_scripts,
                     summary.confirmed_weak_scripts,
+                    summary.consensus_invalid_scripts,
                     summary.inconclusive_scripts,
                     summary.interrupted,
                 );
@@ -212,8 +220,8 @@ impl ProgressReporter {
             ProgressMode::Text => {
                 println!(
                     "block={} hash={} tx={} in={} out={} p2tr_created={} p2tr_spent={} \
-                     script_paths={} analyzed={} candidate={} confirmed={} no_proof={} \
-                     inconclusive={} invalid={}",
+                     script_paths={} analyzed={} candidate={} policy_rejected={} confirmed={} \
+                     consensus_invalid={} no_proof={} inconclusive={} invalid={}",
                     event.height,
                     event.block_hash,
                     event.transactions,
@@ -224,17 +232,20 @@ impl ProgressReporter {
                     event.revealed_script_paths,
                     event.analyzed_scripts,
                     event.candidate_weak_scripts,
+                    event.policy_rejected_scripts,
                     event.confirmed_weak_scripts,
+                    event.consensus_invalid_scripts,
                     event.no_proof_found_scripts,
                     event.inconclusive_scripts,
                     event.invalid_script_scripts,
                 );
                 if let Some(bar) = &self.bar {
                     bar.set_message(format!(
-                        "h={} analyzed={} candidate={} confirmed={}",
+                        "h={} analyzed={} candidate={} policy_rejected={} confirmed={}",
                         event.height,
                         self.totals.analyzed_scripts,
                         self.totals.candidate_weak_scripts,
+                        self.totals.policy_rejected_scripts,
                         self.totals.confirmed_weak_scripts,
                     ));
                 }
@@ -263,7 +274,9 @@ impl ProgressReporter {
             analyzed_scripts: self.totals.analyzed_scripts,
             analyzer_weak_scripts: self.totals.weak_scripts,
             confirmed_weak_scripts: self.totals.confirmed_weak_scripts,
+            policy_rejected_scripts: self.totals.policy_rejected_scripts,
             candidate_weak_scripts: self.totals.candidate_weak_scripts,
+            consensus_invalid_scripts: self.totals.consensus_invalid_scripts,
             no_proof_found_scripts: self.totals.no_proof_found_scripts,
             inconclusive_scripts: self.totals.inconclusive_scripts,
             invalid_script_scripts: self.totals.invalid_script_scripts,
@@ -282,7 +295,9 @@ fn add_counts(total: &mut BlockCounts, value: BlockCounts) {
     total.analyzed_scripts += value.analyzed_scripts;
     total.weak_scripts += value.weak_scripts;
     total.confirmed_weak_scripts += value.confirmed_weak_scripts;
+    total.policy_rejected_scripts += value.policy_rejected_scripts;
     total.candidate_weak_scripts += value.candidate_weak_scripts;
+    total.consensus_invalid_scripts += value.consensus_invalid_scripts;
     total.no_proof_found_scripts += value.no_proof_found_scripts;
     total.inconclusive_scripts += value.inconclusive_scripts;
     total.invalid_script_scripts += value.invalid_script_scripts;
@@ -321,7 +336,9 @@ mod tests {
             analyzed_scripts: counts.analyzed_scripts,
             analyzer_weak_scripts: counts.weak_scripts,
             confirmed_weak_scripts: counts.confirmed_weak_scripts,
+            policy_rejected_scripts: counts.policy_rejected_scripts,
             candidate_weak_scripts: counts.candidate_weak_scripts,
+            consensus_invalid_scripts: counts.consensus_invalid_scripts,
             no_proof_found_scripts: counts.no_proof_found_scripts,
             inconclusive_scripts: counts.inconclusive_scripts,
             invalid_script_scripts: counts.invalid_script_scripts,

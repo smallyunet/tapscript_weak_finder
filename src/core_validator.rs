@@ -189,32 +189,59 @@ impl IsolatedRegtestNode {
             .first()
             .context("Bitcoin Core returned no testmempoolaccept result")?;
 
-        if result.allowed {
-            Ok(ValidationEvidence {
-                detection_status: DetectionStatus::ConfirmedWeak,
-                consensus_status: ConsensusStatus::ConfirmedValid,
-                policy_status: PolicyStatus::Accepted,
-                validator: VALIDATOR_NAME.to_owned(),
-                details: Some(
-                    "Synthetic spend accepted by Bitcoin Core testmempoolaccept on isolated regtest; candidate transaction was not broadcast"
-                        .to_owned(),
-                ),
-            })
-        } else {
-            Ok(ValidationEvidence {
-                detection_status: DetectionStatus::CandidateWeak,
-                consensus_status: ConsensusStatus::Inconclusive,
-                policy_status: PolicyStatus::Inconclusive,
-                validator: VALIDATOR_NAME.to_owned(),
-                details: Some(format!(
-                    "Bitcoin Core rejected the synthetic candidate under combined consensus and mempool-policy evaluation: {}. The RPC result does not identify which layer rejected it",
-                    result
-                        .reject_reason
-                        .as_deref()
-                        .unwrap_or("reason not returned")
-                )),
-            })
-        }
+        Ok(evidence_for_mempool_result(result))
+    }
+}
+
+fn evidence_for_mempool_result(result: &MempoolAcceptResult) -> ValidationEvidence {
+    if result.allowed {
+        return ValidationEvidence {
+            detection_status: DetectionStatus::ConfirmedWeak,
+            consensus_status: ConsensusStatus::ConfirmedValid,
+            policy_status: PolicyStatus::Accepted,
+            validator: VALIDATOR_NAME.to_owned(),
+            details: Some(
+                "Synthetic spend accepted by Bitcoin Core testmempoolaccept on isolated regtest; candidate transaction was not broadcast"
+                    .to_owned(),
+            ),
+        };
+    }
+
+    let reason = result
+        .reject_reason
+        .as_deref()
+        .unwrap_or("reason not returned");
+    let reason_code = reason.split_once(" (").map_or(reason, |(code, _)| code);
+    if reason_code.starts_with("non-mandatory-script-verify-flag") {
+        return ValidationEvidence {
+            detection_status: DetectionStatus::PolicyRejected,
+            consensus_status: ConsensusStatus::ConfirmedValid,
+            policy_status: PolicyStatus::Rejected,
+            validator: VALIDATOR_NAME.to_owned(),
+            details: Some(format!(
+                "Bitcoin Core rejected the synthetic candidate under standard mempool policy only ({reason}). Mandatory script checks passed, so the spend is consensus-valid on this regtest. The candidate transaction was not broadcast"
+            )),
+        };
+    }
+    if reason_code.starts_with("mandatory-script-verify-flag") {
+        return ValidationEvidence {
+            detection_status: DetectionStatus::ConsensusInvalid,
+            consensus_status: ConsensusStatus::Invalid,
+            policy_status: PolicyStatus::NotChecked,
+            validator: VALIDATOR_NAME.to_owned(),
+            details: Some(format!(
+                "Bitcoin Core rejected the synthetic candidate under consensus script rules ({reason}). This witness is not consensus-valid. The candidate transaction was not broadcast"
+            )),
+        };
+    }
+    ValidationEvidence {
+        detection_status: DetectionStatus::CandidateWeak,
+        consensus_status: ConsensusStatus::Inconclusive,
+        policy_status: PolicyStatus::Inconclusive,
+        validator: VALIDATOR_NAME.to_owned(),
+        details: Some(format!(
+            "Bitcoin Core rejected the synthetic candidate under combined consensus and mempool-policy evaluation: {reason}. This reason does not separate the two layers"
+        )),
     }
 }
 
@@ -416,5 +443,90 @@ mod tests {
         assert_eq!(evidence.detection_status, DetectionStatus::ConfirmedWeak);
         assert_eq!(evidence.consensus_status, ConsensusStatus::ConfirmedValid);
         assert_eq!(evidence.policy_status, PolicyStatus::Accepted);
+    }
+
+    #[test]
+    fn non_mandatory_rejection_keeps_consensus_valid() {
+        let evidence = evidence_for_mempool_result(&MempoolAcceptResult {
+            allowed: false,
+            reject_reason: Some("non-mandatory-script-verify-flag (OP_SUCCESS80)".to_owned()),
+        });
+        assert_eq!(evidence.detection_status, DetectionStatus::PolicyRejected);
+        assert_eq!(evidence.consensus_status, ConsensusStatus::ConfirmedValid);
+        assert_eq!(evidence.policy_status, PolicyStatus::Rejected);
+    }
+
+    #[test]
+    fn mandatory_rejection_is_consensus_invalid() {
+        let evidence = evidence_for_mempool_result(&MempoolAcceptResult {
+            allowed: false,
+            reject_reason: Some(
+                "mandatory-script-verify-flag-failed (Stack size must be exactly one after execution)"
+                    .to_owned(),
+            ),
+        });
+        assert_eq!(evidence.detection_status, DetectionStatus::ConsensusInvalid);
+        assert_eq!(evidence.consensus_status, ConsensusStatus::Invalid);
+        assert_eq!(evidence.policy_status, PolicyStatus::NotChecked);
+    }
+
+    #[test]
+    fn generic_rejection_leaves_both_layers_inconclusive() {
+        let evidence = evidence_for_mempool_result(&MempoolAcceptResult {
+            allowed: false,
+            reject_reason: Some("min relay fee not met".to_owned()),
+        });
+        assert_eq!(evidence.detection_status, DetectionStatus::CandidateWeak);
+        assert_eq!(evidence.consensus_status, ConsensusStatus::Inconclusive);
+        assert_eq!(evidence.policy_status, PolicyStatus::Inconclusive);
+    }
+
+    #[test]
+    #[ignore = "requires a locally installed Bitcoin Core executable"]
+    fn bitcoin_core_marks_op_success_policy_rejected() {
+        let script = vec![0x50];
+        let analysis = analyze_script(&script, 1);
+        assert_eq!(analysis.status, AnalysisStatus::Weak);
+        let witness = decoded_proof(&analysis);
+        let bitcoind = std::env::var_os("BITCOIND_PATH").unwrap_or_else(|| "bitcoind".into());
+        let mut validator = CoreRegtestValidator::start(Path::new(&bitcoind)).unwrap();
+        let evidence = validator.validate(&script, &witness).unwrap();
+        assert_eq!(evidence.detection_status, DetectionStatus::PolicyRejected);
+        assert_eq!(evidence.consensus_status, ConsensusStatus::ConfirmedValid);
+        assert_eq!(evidence.policy_status, PolicyStatus::Rejected);
+    }
+
+    #[test]
+    #[ignore = "requires a locally installed Bitcoin Core executable"]
+    fn bitcoin_core_marks_unknown_pubkey_policy_rejected() {
+        let script = vec![0x51, 0xac];
+        let analysis = analyze_script(&script, 1);
+        assert_eq!(analysis.status, AnalysisStatus::Weak);
+        assert_eq!(
+            analysis.vulnerability_class.as_deref(),
+            Some("upgradable_pubkey_type")
+        );
+        let witness = decoded_proof(&analysis);
+        let bitcoind = std::env::var_os("BITCOIND_PATH").unwrap_or_else(|| "bitcoind".into());
+        let mut validator = CoreRegtestValidator::start(Path::new(&bitcoind)).unwrap();
+        let evidence = validator.validate(&script, &witness).unwrap();
+        assert_eq!(
+            evidence.detection_status,
+            DetectionStatus::PolicyRejected,
+            "{:?}",
+            evidence.details
+        );
+        assert_eq!(evidence.consensus_status, ConsensusStatus::ConfirmedValid);
+        assert_eq!(evidence.policy_status, PolicyStatus::Rejected);
+    }
+
+    fn decoded_proof(analysis: &crate::analyzer::AnalysisResult) -> Vec<Vec<u8>> {
+        analysis
+            .proof_witness
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|item| hex::decode(item).unwrap())
+            .collect()
     }
 }

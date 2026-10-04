@@ -121,18 +121,39 @@ detection statuses:
 A synthetic equivalent passed Bitcoin Core consensus checks and current mempool
 policy under `testmempoolaccept`.
 
+### `policy_rejected`
+
+`testmempoolaccept` returned a reason beginning with
+`non-mandatory-script-verify-flag`. Bitcoin Core
+rechecks with mandatory flags before using that reason, so the synthetic spend
+passed consensus script rules and failed only a standardness rule. Consensus
+status is `confirmed_valid` and policy status is `rejected`. This is not
+`confirmed_weak`: standard mempool policy did not accept the transaction.
+
 ### `candidate_weak`
 
 The analyzer found a candidate, but Core validation was not requested, failed,
-or returned a generic rejection. Because `testmempoolaccept` combines consensus
-and policy, a generic rejection leaves both layers inconclusive unless
-additional evidence separates them.
+or returned a rejection whose reason does not separate consensus from policy.
+Fee, dust, and other non-script reasons stay in this state, with both layers
+inconclusive.
 
 A persisted candidate is not downgraded merely because a later run uses a
 smaller search bound or otherwise fails to rediscover its proof. A later
-candidate refreshes the proof and matching search metadata together, while an
-authoritative validation may promote it to `confirmed_weak`. Once confirmed,
-later local candidate generation does not replace its authoritative evidence.
+candidate refreshes the proof and matching search metadata together. An
+authoritative validation may promote it to `policy_rejected` or
+`confirmed_weak`, or replace it with `consensus_invalid` when Core refutes that
+witness. `policy_rejected` and `confirmed_weak` are not replaced by a later
+unvalidated candidate or by a consensus failure of a different witness. Once
+confirmed, later local candidate generation does not replace its authoritative
+evidence.
+
+### `consensus_invalid`
+
+`testmempoolaccept` returned a reason beginning with
+`mandatory-script-verify-flag`. The witness failed
+consensus script rules. The leaf keeps its analysis row, but its weakness
+evidence is removed so the risk report does not present it as spendable. A
+later consensus-valid validation may replace this refutation.
 
 ### `no_proof_found`
 
