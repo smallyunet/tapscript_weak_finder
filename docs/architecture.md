@@ -46,6 +46,7 @@ flowchart TD
 | Module | Responsibility |
 | --- | --- |
 | `src/main.rs` | CLI parsing, authentication selection, command dispatch, and JSON output. |
+| `src/serve.rs` | Read-only progress panel on the configured listen address. Counts and recent block totals only. |
 | `src/rpc.rs` | Blocking Bitcoin Core JSON-RPC client and exact BTC-to-satoshi decoding. |
 | `src/scanner.rs` | Scan-range validation, canonical iteration, interruption handling, resume, and reorganization reconciliation. |
 | `src/taproot.rs` | P2TR detection, annex/script/control-block separation, TapScript initial-stack extraction, tagged hashes, and output-key verification. |

@@ -9,6 +9,7 @@ mod detection;
 mod progress;
 mod rpc;
 mod scanner;
+mod serve;
 mod taproot;
 
 use std::{path::PathBuf, time::Duration};
@@ -44,6 +45,8 @@ enum Command {
     Status,
     /// Export current confirmed matches as JSON.
     Report(ReportArgs),
+    /// Serve a progress panel. It exposes counts only, on the given address.
+    Serve(ServeArgs),
     /// Analyze one raw TapScript locally, with optional isolated Core validation.
     AnalyzeScript(AnalyzeScriptArgs),
 }
@@ -161,6 +164,13 @@ impl From<OutputArg> for ProgressMode {
 }
 
 #[derive(Args, Debug)]
+struct ServeArgs {
+    /// Listen address. The panel is reachable on this interface and port.
+    #[arg(long, default_value = "0.0.0.0:8787")]
+    bind: String,
+}
+
+#[derive(Args, Debug)]
 struct ReportArgs {
     #[arg(long)]
     output: Option<PathBuf>,
@@ -215,6 +225,7 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&db.status()?)?);
             Ok(())
         }
+        Command::Serve(args) => serve::run(&cli.db, &args.bind),
         Command::Report(args) => {
             let report = db.report()?;
             let bytes = if args.pretty {

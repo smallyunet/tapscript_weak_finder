@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::Serialize;
 
 use crate::{
@@ -63,6 +63,17 @@ pub struct BlockCounts {
     pub no_proof_found_scripts: u64,
     pub inconclusive_scripts: u64,
     pub invalid_script_scripts: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecentBlock {
+    pub height: u64,
+    pub block_hash: String,
+    pub transactions: u64,
+    pub p2tr_created: u64,
+    pub p2tr_spent: u64,
+    pub script_paths: u64,
+    pub weak_scripts: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -139,6 +150,47 @@ impl Database {
         };
         db.migrate()?;
         Ok(db)
+    }
+
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            bail!("database does not exist: {}", path.display());
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("open SQLite database {}", path.display()))?;
+        conn.pragma_update(None, "query_only", "ON")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            conn,
+            path: path.to_owned(),
+        })
+    }
+
+    pub fn recent_blocks(&self, limit: u64) -> Result<Vec<RecentBlock>> {
+        let mut statement = self.conn.prepare(
+            "SELECT height, block_hash, transactions, p2tr_created, p2tr_spent,
+                    script_paths, weak_scripts
+             FROM scanned_blocks
+             ORDER BY height DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok(RecentBlock {
+                height: row.get(0)?,
+                block_hash: row.get(1)?,
+                transactions: row.get(2)?,
+                p2tr_created: row.get(3)?,
+                p2tr_spent: row.get(4)?,
+                script_paths: row.get(5)?,
+                weak_scripts: row.get(6)?,
+            })
+        })?;
+        let mut blocks = rows.collect::<Result<Vec<_>, _>>()?;
+        blocks.reverse();
+        Ok(blocks)
     }
 
     fn migrate(&self) -> Result<()> {

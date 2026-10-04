@@ -219,6 +219,25 @@ Suppresses progress reporting.
 
 The former `--progress text|json|none` option remains an alias.
 
+## Progress panel
+
+`serve` reads one scanner database and listens on `0.0.0.0:8787` unless
+`--bind` selects another address. The page refreshes counts from `/api/status`.
+It shows heights, block totals, and detection totals. It does not read or
+return the risk report, so outpoints, scripts, and witnesses stay out of the
+response.
+
+Open the database with the scan stopped, or while a scan is running. The panel
+uses SQLite query-only mode and does not migrate or update scan state. Until
+the database file exists, `/api/status` returns HTTP 503.
+
+`docker-compose.yml` builds the image on the host that runs it. The `scan`
+service reads `BITCOIN_RPC_URL` from a local `.env` and writes
+`data/smoke.sqlite` for heights 709632–709832. The `panel` service publishes
+`0.0.0.0:8787` against that file. The optional `forum` profile writes a second
+database for heights 959019–959020. Neither service submits transactions or
+starts Bitcoin Core.
+
 ## Reports
 
 Generate a human-readable JSON file:

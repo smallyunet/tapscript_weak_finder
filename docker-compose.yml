@@ -1,0 +1,60 @@
+name: tapscript-smoke
+
+services:
+  scan:
+    build: .
+    image: tapscript-weak-finder:local
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    restart: "no"
+    command:
+      - --db
+      - /data/smoke.sqlite
+      - scan
+      - --start-height
+      - "709632"
+      - --end-height
+      - "709832"
+      - --output
+      - json
+      - --min-free-disk-mib
+      - "512"
+
+  panel:
+    image: tapscript-weak-finder:local
+    depends_on:
+      - scan
+    ports:
+      - "0.0.0.0:8787:8787"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    command:
+      - --db
+      - /data/smoke.sqlite
+      - serve
+      - --bind
+      - 0.0.0.0:8787
+
+  forum:
+    image: tapscript-weak-finder:local
+    profiles: ["forum"]
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    restart: "no"
+    command:
+      - --db
+      - /data/forum.sqlite
+      - scan
+      - --start-height
+      - "959019"
+      - --end-height
+      - "959020"
+      - --output
+      - json
+      - --min-free-disk-mib
+      - "512"

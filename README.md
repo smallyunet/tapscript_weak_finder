@@ -281,6 +281,20 @@ witness. Candidate/confirmed weaknesses plus `inconclusive` and
 records the proof strategy; older databases are migrated with
 `legacy_unspecified` for proofs created before that field existed.
 
+### Show scan progress in a browser
+
+```bash
+cargo run --release -- \
+  --db tapscript-audit.sqlite \
+  serve \
+  --bind 0.0.0.0:8787
+```
+
+The page and `/api/status` show checkpoint heights, per-block counts, and
+detection totals. They do not list outpoints, scripts, or witnesses. The
+default listen address is `0.0.0.0:8787`. `docker-compose.yml` builds that
+binary on the server, scans a bounded height range, and publishes the panel.
+
 ### Inspect scan status
 
 ```bash
